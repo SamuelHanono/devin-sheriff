@@ -498,6 +498,22 @@ def main():
     selected_repo_name = st.sidebar.selectbox("Select Repository", repo_names)
     selected_repo = next(r for r in repos if r.name == selected_repo_name)
 
+    # AUTO-SYNC: Automatically sync on first load for each repo
+    auto_sync_key = f"auto_synced_{selected_repo.id}"
+    if auto_sync_key not in st.session_state:
+        st.session_state[auto_sync_key] = False
+    
+    if not st.session_state[auto_sync_key]:
+        with st.spinner(f"Auto-syncing {selected_repo.name}..."):
+            try:
+                sync_repo_issues(selected_repo.url)
+                sync_pr_statuses(selected_repo.url)
+                invalidate_cache()
+                st.session_state[auto_sync_key] = True
+            except Exception as e:
+                st.sidebar.warning(f"Auto-sync failed: {e}")
+                st.session_state[auto_sync_key] = True
+
     # 2. SIDEBAR: GLOBAL REFRESH BUTTONS (Always Visible)
     st.sidebar.markdown("---")
     st.sidebar.subheader("🔄 Sync Controls")
