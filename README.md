@@ -1,6 +1,22 @@
-# Devin Sheriff (Local)
+# Devin Sheriff v2.0
 
 Devin Sheriff is a local CLI and Dashboard tool that connects to GitHub repositories and uses the Devin AI API to automatically **Scope** (plan) and **Execute** (fix) GitHub issues. It allows developers to manage issues locally, request AI-generated action plans, and trigger autonomous coding sessions that result in real Pull Requests.
+
+## What's New in v2.0
+
+**Factory Reset (Danger Zone)** - A new "Nuclear Options" section in the sidebar allows you to completely reset the database and start fresh with a single click (with confirmation).
+
+**Manual Close Issue Workflow** - Close issues directly from the dashboard with the option to also close them on GitHub remotely.
+
+**Enhanced Refresh/Sync** - Two sync modes: "Quick Sync" for fast issue updates and "Deep Sync" that also checks PR statuses (merged/closed) and auto-updates local issue states.
+
+**Session State Caching** - The dashboard now caches repository and issue data for a snappier experience without constant database queries.
+
+**Asynchronous Execution** - Scoping and Execution tasks now run in background threads with progress indicators, keeping the UI responsive.
+
+**Plan Editor** - After scoping, you can now edit the JSON action plan before executing. This gives you cost control and the ability to correct Devin's approach before spending API credits.
+
+**Live Logs Viewer** - A new "Live Logs" tab displays the last 50 lines from the log file for easy debugging without checking the terminal.
 
 ## Features
 
@@ -192,6 +208,59 @@ The Devin client interacts with the official Devin API at `https://api.devin.ai/
 
 **Execute Sessions** send a prompt with the approved action plan, instructing Devin to implement the fix and open a PR. The client polls until completion (default timeout: 10 minutes).
 
+## Testing the v2.0 Features
+
+After installation and setup, you can test the new features as follows:
+
+### 1. Testing the Dashboard
+
+Launch the dashboard:
+```bash
+streamlit run devin_sheriff/dashboard.py
+```
+
+### 2. Testing Enhanced Sync
+
+In the sidebar, you'll see two sync buttons:
+- **Quick Sync**: Click to fetch the latest issues from GitHub
+- **Deep Sync**: Click to sync issues AND check PR statuses (merged/closed PRs will auto-update local issue states)
+
+### 3. Testing the Plan Editor
+
+1. Select an issue with status "NEW"
+2. Click "Start Scoping" to generate an action plan
+3. Once scoped, you'll see an editable JSON text area
+4. Modify the plan as needed
+5. Click "Save Edited Plan" to use your modified plan
+6. Click "Execute Fix" to run with your edited plan
+
+### 4. Testing Manual Close Issue
+
+1. Select any open issue
+2. In the Actions panel, click "Mark as Closed"
+3. Choose whether to also close on GitHub (checkbox)
+4. Confirm to close the issue
+
+### 5. Testing Factory Reset
+
+1. In the sidebar, expand "Nuclear Options" under "Danger Zone"
+2. Click "Delete All Data & Reset"
+3. Confirm the action
+4. The database will be wiped and the app will restart fresh
+
+### 6. Testing Live Logs
+
+1. Click the "Live Logs" tab in the main area
+2. View the last 50 lines of the log file
+3. Click "Refresh Logs" to update
+
+### 7. Testing Async Execution
+
+When you click "Start Scoping" or "Execute Fix":
+- The UI remains responsive
+- A progress indicator shows task status
+- Click "Check Status" to see if the task completed
+
 ## Disclaimer
 
 This tool uses paid API credits from Devin AI. Each Scope and Execute operation consumes API credits based on the complexity and duration of the AI session. Please monitor your Devin API usage to avoid unexpected charges.
@@ -205,5 +274,3 @@ This project is provided as-is for educational and development purposes.
 ## Contributing
 
 Contributions are welcome! Please open an issue or submit a Pull Request with any improvements or bug fixes.
-
-python main.py remove sherif-tester

@@ -76,6 +76,41 @@ class GitHubClient:
             logger.error(f"Failed to fetch issue #{issue_number}: {e}")
             return None
 
+    def close_issue(self, owner: str, repo: str, issue_number: int) -> bool:
+        """Close an issue on GitHub remotely."""
+        url = f"{self.base_url}/repos/{owner}/{repo}/issues/{issue_number}"
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                resp = client.patch(url, headers=self.headers, json={"state": "closed"})
+                resp.raise_for_status()
+                logger.info(f"Successfully closed issue #{issue_number} on GitHub")
+                return True
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 403:
+                logger.error(f"Permission denied to close issue #{issue_number}")
+            elif e.response.status_code == 404:
+                logger.error(f"Issue #{issue_number} not found")
+            else:
+                logger.error(f"Failed to close issue #{issue_number}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to close issue #{issue_number}: {e}")
+            return False
+
+    def get_pull_request(self, owner: str, repo: str, pr_number: int) -> Optional[Dict[str, Any]]:
+        """Fetch a specific pull request to check its status."""
+        url = f"{self.base_url}/repos/{owner}/{repo}/pulls/{pr_number}"
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                resp = client.get(url, headers=self.headers)
+                if resp.status_code == 404:
+                    return None
+                resp.raise_for_status()
+                return resp.json()
+        except Exception as e:
+            logger.error(f"Failed to fetch PR #{pr_number}: {e}")
+            return None
+
     def fetch_open_issues(self, owner: str, repo: str) -> List[Dict[str, Any]]:
         """Fetch all open issues for a repo (handles pagination)."""
         url = f"{self.base_url}/repos/{owner}/{repo}/issues"

@@ -72,17 +72,38 @@ class DevinSession(Base):
 
 # --- DATABASE INITIALIZATION ---
 
+def get_engine():
+    """Get or create the database engine."""
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+    return create_engine(DB_FILE, connect_args={"check_same_thread": False})
+
 def init_db():
     """Creates tables if they don't exist and returns a session factory."""
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-    
-    # connect_args check_same_thread=False is needed for SQLite with Streamlit
-    engine = create_engine(DB_FILE, connect_args={"check_same_thread": False})
-    
+    engine = get_engine()
     Base.metadata.create_all(engine)
-    
-    # Use sessionmaker factory
     return sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+def reset_database():
+    """
+    Factory reset: Drop all tables and recreate them.
+    Returns True on success, False on failure.
+    """
+    try:
+        db_path = DB_DIR / "sheriff.db"
+        if db_path.exists():
+            db_path.unlink()
+        
+        global SessionLocal
+        SessionLocal = init_db()
+        return True
+    except Exception as e:
+        import logging
+        logging.error(f"Database reset failed: {e}")
+        return False
+
+def get_db_path() -> Path:
+    """Return the path to the database file."""
+    return DB_DIR / "sheriff.db"
 
 # Create a global Session Factory
 SessionLocal = init_db()
