@@ -519,18 +519,22 @@ def render_issue_workspace(issue, repo, db):
         # Check if async task is running
         task_runner = st.session_state.task_runner
         
+        # Auto-check for task completion
+        if task_runner.status == "completed":
+            handle_task_completion(issue, task_runner, db)
+            st.rerun()
+        elif task_runner.status == "failed":
+            st.error(f"Task failed: {task_runner.error}")
+            task_runner.status = "idle"
+        
         if task_runner.is_running():
             st.info("🔄 Task in progress...")
             progress = task_runner.get_progress()
             st.progress(progress / 100)
             
-            if st.button("Check Status"):
-                if task_runner.status == "completed":
-                    handle_task_completion(issue, task_runner, db)
-                elif task_runner.status == "failed":
-                    st.error(f"Task failed: {task_runner.error}")
-                    task_runner.status = "idle"
-                st.rerun()
+            # Auto-refresh every 2 seconds while task is running
+            time.sleep(2)
+            st.rerun()
         else:
             # BUTTON: SCOPE (Planning)
             if issue.status in ["NEW", "DONE"]:

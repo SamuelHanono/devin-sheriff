@@ -67,33 +67,47 @@ class DevinClient:
         """
         # 1. Try structured output if available (Future-proofing)
         if "structured_output" in session_data and session_data["structured_output"]:
+            logger.info("Found structured_output in session data")
             return session_data["structured_output"]
 
         # 2. Parse last assistant message
         session_id = session_data.get("session_id")
         if not session_id:
-             return {"error": "Invalid session data", "raw": session_data}
+            logger.error("No session_id in session data")
+            return {"error": "Invalid session data", "raw": session_data}
 
         try:
             with httpx.Client(timeout=30.0) as client:
                 resp = client.get(f"{self.base_url}/sessions/{session_id}/events", headers=self.headers)
+                logger.info(f"Fetched events for session {session_id}, status: {resp.status_code}")
+                
                 if resp.status_code == 200:
                     events = resp.json()
+                    logger.info(f"Found {len(events)} events in session")
+                    
                     # Look for the last message from 'assistant'
                     for event in reversed(events):
                         if event.get("type") == "assistant_message":
                             content = event.get("message", {}).get("content", "")
+                            logger.info(f"Found assistant message, length: {len(content)}")
+                            
                             # Try to find JSON block
                             json_match = re.search(r"\{.*\}", content, re.DOTALL)
                             if json_match:
                                 try:
-                                    return json.loads(json_match.group(0))
-                                except json.JSONDecodeError:
+                                    result = json.loads(json_match.group(0))
+                                    logger.info(f"Successfully parsed JSON with keys: {list(result.keys())}")
+                                    return result
+                                except json.JSONDecodeError as e:
+                                    logger.warning(f"JSON decode error: {e}")
                                     continue
+                else:
+                    logger.error(f"Failed to fetch events: {resp.status_code}")
         except Exception as e:
             logger.error(f"Error fetching events: {e}")
         
         # Fallback if parsing fails
+        logger.warning("Could not extract JSON from session, returning error dict")
         return {
             "error": "Could not parse JSON", 
             "raw_debug": "Devin finished but didn't return strict JSON."
