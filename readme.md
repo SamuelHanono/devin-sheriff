@@ -3,9 +3,12 @@ source venv/bin/activate
 
 pip install -r requirements.txt
 
-python main.py setup
+./venv/bin/python main.py setup
+
 
 #run repo
-python main.py connect https://github.com/SamuelHanono/sherif-tester
+###python main.py connect https://github.com/SamuelHanono/sherif-tester
 
 ./venv/bin/python main.py connect https://github.com/SamuelHanono/sherif-tester
+
+./venv/bin/python -m streamlit run devin_sheriff/dashboard.py
