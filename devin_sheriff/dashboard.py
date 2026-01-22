@@ -280,6 +280,9 @@ def main():
         index=0
     )
 
+    # Settings & Security Section
+    render_settings_security()
+    
     # Render Danger Zone in sidebar
     render_danger_zone()
     
@@ -342,6 +345,31 @@ def render_main_dashboard(selected_repo, filter_status):
             render_issue_workspace(current_issue, selected_repo, db)
     finally:
         db.close()
+
+
+def render_settings_security():
+    """Render the Settings & Security section in sidebar."""
+    st.sidebar.markdown("---")
+    
+    with st.sidebar.expander("⚙️ Settings & Security", expanded=False):
+        st.markdown("**Local Storage Paths**")
+        st.caption("Your data is stored locally on your machine:")
+        
+        config_path = CONFIG_DIR / "config.json"
+        db_path = get_db_path()
+        
+        st.code(f"Config: {config_path}", language=None)
+        st.code(f"Database: {db_path}", language=None)
+        st.code(f"Logs: {LOG_FILE}", language=None)
+        
+        st.markdown("---")
+        st.markdown("**Security Note**")
+        st.caption("Your API keys (GitHub PAT and Devin API Key) are stored locally in the config file above. They are never sent to any third-party servers except GitHub and Devin APIs.")
+        
+        if config_path.exists():
+            st.success("Config file exists")
+        else:
+            st.warning("Config file not found. Run setup first.")
 
 
 def render_danger_zone():
@@ -477,28 +505,42 @@ def render_issue_workspace(issue, repo, db):
             st.markdown("**Manual Controls**")
             
             if issue.status != "DONE":
-                if st.button("✅ Mark as Closed", key=f"close_{issue.id}", use_container_width=True):
-                    st.session_state.show_close_confirm = issue.id
+                col_close1, col_close2 = st.columns(2)
+                with col_close1:
+                    if st.button("✅ Close Locally Only", key=f"close_local_{issue.id}", use_container_width=True):
+                        result = close_issue_workflow(issue, repo, db, close_on_github=False)
+                        st.success(f"Issue #{issue.number} marked as closed locally!")
+                        invalidate_cache()
+                        time.sleep(1)
+                        st.rerun()
+                
+                with col_close2:
+                    if st.button("✅ Close on GitHub", key=f"close_gh_{issue.id}", use_container_width=True):
+                        st.session_state.show_close_confirm = issue.id
             
             if st.session_state.get('show_close_confirm') == issue.id:
-                st.warning("Close this issue?")
-                
-                close_on_github = st.checkbox("Also close on GitHub", value=True, key=f"gh_close_{issue.id}")
+                st.warning(f"Close issue #{issue.number} on GitHub?")
+                st.caption("This will also close the issue remotely on GitHub.")
                 
                 col1, col2 = st.columns(2)
                 with col1:
-                    if st.button("Confirm Close", key=f"confirm_close_{issue.id}"):
-                        success = close_issue_workflow(issue, repo, db, close_on_github)
+                    if st.button("Confirm Close on GitHub", key=f"confirm_close_{issue.id}", type="primary"):
+                        result = close_issue_workflow(issue, repo, db, close_on_github=True)
                         st.session_state.show_close_confirm = None
-                        if success:
-                            st.success("Issue closed!")
+                        
+                        if result["success"]:
+                            st.success(f"Issue #{issue.number} closed on GitHub!")
                             invalidate_cache()
                             time.sleep(1)
                             st.rerun()
                         else:
-                            st.warning("Local status updated, but failed to close on GitHub")
+                            if result["error_type"] == "permission_denied":
+                                st.error(result["error_message"])
+                                st.info("💡 Tip: The issue was closed locally. To close on GitHub, generate a new token with 'repo' scope.")
+                            else:
+                                st.warning(f"Local status updated, but GitHub close failed: {result['error_message']}")
                             invalidate_cache()
-                            time.sleep(1)
+                            time.sleep(2)
                             st.rerun()
                 with col2:
                     if st.button("Cancel", key=f"cancel_close_{issue.id}"):
@@ -587,12 +629,23 @@ def handle_task_completion(issue, task_runner, db):
     task_runner.result = None
 
 
-def close_issue_workflow(issue, repo, db, close_on_github: bool = False) -> bool:
-    """Close an issue locally and optionally on GitHub."""
+def close_issue_workflow(issue, repo, db, close_on_github: bool = False) -> Dict[str, Any]:
+    """
+    Close an issue locally and optionally on GitHub.
+    Returns dict with 'success', 'local_closed', 'github_closed', 'error_message'.
+    """
     issue.status = "DONE"
     issue.state = "closed"
     db.commit()
     logger.info(f"Issue #{issue.number} marked as closed locally")
+    
+    result = {
+        "success": True,
+        "local_closed": True,
+        "github_closed": False,
+        "error_message": None,
+        "error_type": None
+    }
     
     if close_on_github:
         try:
@@ -603,15 +656,22 @@ def close_issue_workflow(issue, repo, db, close_on_github: bool = False) -> bool
             if match:
                 owner, repo_name = match.groups()
                 repo_name = repo_name.replace(".git", "")
-                success = gh.close_issue(owner, repo_name, issue.number)
-                if success:
+                gh_result = gh.close_issue(owner, repo_name, issue.number)
+                
+                if gh_result["success"]:
                     logger.info(f"Issue #{issue.number} closed on GitHub")
-                return success
+                    result["github_closed"] = True
+                else:
+                    result["success"] = False
+                    result["error_message"] = gh_result["message"]
+                    result["error_type"] = gh_result["error_type"]
         except Exception as e:
             logger.error(f"Failed to close issue on GitHub: {e}")
-            return False
+            result["success"] = False
+            result["error_message"] = str(e)
+            result["error_type"] = "unknown"
     
-    return True
+    return result
 
 
 # --- LEGACY ACTION HANDLERS (kept for compatibility) ---

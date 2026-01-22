@@ -237,24 +237,31 @@ In the sidebar, you'll see two sync buttons:
 ### 4. Testing Manual Close Issue
 
 1. Select any open issue
-2. In the Actions panel, click "Mark as Closed"
-3. Choose whether to also close on GitHub (checkbox)
-4. Confirm to close the issue
+2. In the Actions panel, you'll see two buttons:
+   - **Close Locally Only**: Marks the issue as closed in your local database only
+   - **Close on GitHub**: Closes the issue both locally AND on GitHub (requires token with 'repo' scope)
+3. If you click "Close on GitHub" and get a 403 error, you'll see a helpful message explaining that your token needs the 'repo' scope
 
-### 5. Testing Factory Reset
+### 5. Testing Settings & Security
+
+1. In the sidebar, expand "Settings & Security"
+2. View the local storage paths for your config, database, and logs
+3. Verify your config file exists (green checkmark if found)
+
+### 6. Testing Factory Reset
 
 1. In the sidebar, expand "Nuclear Options" under "Danger Zone"
 2. Click "Delete All Data & Reset"
 3. Confirm the action
-4. The database will be wiped and the app will restart fresh
+4. The database file will be physically deleted and recreated fresh
 
-### 6. Testing Live Logs
+### 7. Testing Live Logs
 
 1. Click the "Live Logs" tab in the main area
 2. View the last 50 lines of the log file
 3. Click "Refresh Logs" to update
 
-### 7. Testing Async Execution
+### 8. Testing Async Execution
 
 When you click "Start Scoping" or "Execute Fix":
 - The UI remains responsive

@@ -76,26 +76,48 @@ class GitHubClient:
             logger.error(f"Failed to fetch issue #{issue_number}: {e}")
             return None
 
-    def close_issue(self, owner: str, repo: str, issue_number: int) -> bool:
-        """Close an issue on GitHub remotely."""
+    def close_issue(self, owner: str, repo: str, issue_number: int) -> Dict[str, Any]:
+        """
+        Close an issue on GitHub remotely.
+        Returns a dict with 'success' bool and 'error_type' if failed.
+        error_type can be: 'permission_denied', 'not_found', 'unknown'
+        """
         url = f"{self.base_url}/repos/{owner}/{repo}/issues/{issue_number}"
         try:
             with httpx.Client(timeout=self.timeout) as client:
                 resp = client.patch(url, headers=self.headers, json={"state": "closed"})
                 resp.raise_for_status()
                 logger.info(f"Successfully closed issue #{issue_number} on GitHub")
-                return True
+                return {"success": True, "error_type": None, "message": "Issue closed successfully"}
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 403:
                 logger.error(f"Permission denied to close issue #{issue_number}")
+                return {
+                    "success": False, 
+                    "error_type": "permission_denied",
+                    "message": "Permission Denied. Your GitHub Token is read-only. Please generate a new token with 'repo' scope."
+                }
             elif e.response.status_code == 404:
                 logger.error(f"Issue #{issue_number} not found")
+                return {
+                    "success": False,
+                    "error_type": "not_found", 
+                    "message": f"Issue #{issue_number} not found on GitHub."
+                }
             else:
                 logger.error(f"Failed to close issue #{issue_number}: {e}")
-            return False
+                return {
+                    "success": False,
+                    "error_type": "unknown",
+                    "message": f"GitHub API error: {e.response.status_code}"
+                }
         except Exception as e:
             logger.error(f"Failed to close issue #{issue_number}: {e}")
-            return False
+            return {
+                "success": False,
+                "error_type": "unknown",
+                "message": f"Connection error: {str(e)}"
+            }
 
     def get_pull_request(self, owner: str, repo: str, pr_number: int) -> Optional[Dict[str, Any]]:
         """Fetch a specific pull request to check its status."""
