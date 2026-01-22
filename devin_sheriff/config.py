@@ -21,6 +21,7 @@ class AppConfig(BaseModel):
     github_token: Optional[str] = Field(None, description="GitHub Personal Access Token")
     devin_api_key: Optional[str] = Field(None, description="Devin AI API Key")
     devin_api_url: str = Field("https://api.devin.ai/v1", description="Devin API Endpoint")
+    webhook_url: Optional[str] = Field(None, description="Webhook URL for notifications (Slack/Discord)")
     
     def is_complete(self) -> bool:
         """Returns True only if critical keys are present."""

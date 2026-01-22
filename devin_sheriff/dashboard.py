@@ -20,9 +20,10 @@ sys.path.append(str(root_dir))
 
 from devin_sheriff.models import SessionLocal, Repo, Issue, reset_database, get_db_path, init_db
 from devin_sheriff.devin_client import DevinClient, load_governance_rules, save_governance_rules, RULES_FILE
-from devin_sheriff.config import load_config, CONFIG_DIR
+from devin_sheriff.config import load_config, save_config, CONFIG_DIR
 from devin_sheriff.sync import sync_repo_issues, sync_pr_statuses
 from devin_sheriff.github_client import GitHubClient
+from devin_sheriff.utils import test_webhook, notify_scope_complete, notify_pr_opened
 
 # --- LOGGING SETUP ---
 LOG_FILE = CONFIG_DIR / "sheriff.log"
@@ -414,6 +415,71 @@ def get_ci_badge(ci_status: str, retry_count: int = 0) -> str:
     else:
         return "⚪ Unknown"
 
+
+# --- THE WANTED LIST: TECH DEBT SCANNER ---
+def scan_for_todos(repo_path: str) -> List[Dict[str, Any]]:
+    """
+    Scan a local repository for TODO and FIXME comments.
+    Returns a list of dicts with file, line, and comment info.
+    """
+    todos = []
+    patterns = [
+        r'#\s*(TODO|FIXME|XXX|HACK|BUG)[\s:]+(.+)',
+        r'//\s*(TODO|FIXME|XXX|HACK|BUG)[\s:]+(.+)',
+        r'/\*\s*(TODO|FIXME|XXX|HACK|BUG)[\s:]+(.+)',
+    ]
+    
+    skip_dirs = {'.git', 'node_modules', '__pycache__', 'venv', '.venv', 'dist', 'build'}
+    skip_extensions = {'.pyc', '.pyo', '.so', '.dll', '.exe', '.bin', '.jpg', '.png', '.gif'}
+    
+    repo_path = Path(repo_path)
+    if not repo_path.exists():
+        return []
+    
+    for file_path in repo_path.rglob('*'):
+        if file_path.is_dir():
+            continue
+        
+        if any(skip_dir in file_path.parts for skip_dir in skip_dirs):
+            continue
+        
+        if file_path.suffix.lower() in skip_extensions:
+            continue
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                for line_num, line in enumerate(f, 1):
+                    for pattern in patterns:
+                        match = re.search(pattern, line, re.IGNORECASE)
+                        if match:
+                            tag = match.group(1).upper()
+                            comment = match.group(2).strip()[:100]
+                            todos.append({
+                                "file": str(file_path.relative_to(repo_path)),
+                                "line": line_num,
+                                "tag": tag,
+                                "comment": comment,
+                                "full_path": str(file_path)
+                            })
+                            break
+        except Exception:
+            continue
+    
+    return todos
+
+
+def get_tribunal_grade_color(grade: str) -> str:
+    """Return color for tribunal grade."""
+    grade_colors = {
+        "A": "green",
+        "B": "blue",
+        "C": "orange",
+        "D": "red",
+        "F": "red"
+    }
+    return grade_colors.get(grade.upper(), "gray")
+
+
 # --- MAIN DASHBOARD LOGIC ---
 def main():
     st.title("🤠 Devin Sheriff v2.0")
@@ -483,7 +549,7 @@ def main():
     render_danger_zone()
     
     # 3. MAIN CONTENT AREA WITH TABS
-    tab_main, tab_logs, tab_laws = st.tabs(["🛠 Issue Management", "📜 Live Logs", "👮‍♂️ Laws"])
+    tab_main, tab_logs, tab_laws, tab_wanted = st.tabs(["🛠 Issue Management", "📜 Live Logs", "👮‍♂️ Laws", "📜 Wanted"])
     
     with tab_main:
         render_main_dashboard(selected_repo, filter_status)
@@ -493,6 +559,9 @@ def main():
     
     with tab_laws:
         render_laws_tab()
+    
+    with tab_wanted:
+        render_wanted_tab(selected_repo)
 
 
 def render_main_dashboard(selected_repo, filter_status):
@@ -560,6 +629,32 @@ def render_settings_security():
         st.code(f"Config: {config_path}", language=None)
         st.code(f"Database: {db_path}", language=None)
         st.code(f"Logs: {LOG_FILE}", language=None)
+        
+        st.markdown("---")
+        st.markdown("**The Telegraph (Webhooks)**")
+        st.caption("Configure a webhook URL to receive notifications (Slack/Discord).")
+        
+        config = load_config()
+        current_webhook = config.webhook_url or ""
+        
+        new_webhook = st.text_input("Webhook URL", value=current_webhook, placeholder="https://hooks.slack.com/...")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("💾 Save Webhook", use_container_width=True):
+                config.webhook_url = new_webhook if new_webhook else None
+                save_config(config)
+                st.success("Webhook saved!")
+                time.sleep(1)
+                st.rerun()
+        
+        with col2:
+            if st.button("🔔 Test Notification", use_container_width=True):
+                result = test_webhook()
+                if result["success"]:
+                    st.success(result["message"])
+                else:
+                    st.error(result["message"])
         
         st.markdown("---")
         st.markdown("**Security Note**")
@@ -698,6 +793,9 @@ def render_issue_workspace(issue, repo, db):
             # Plan Editor Feature for SCOPED issues
             if issue.status == "SCOPED":
                 render_plan_editor(issue, db)
+                
+                # FEATURE: The Tribunal (Plan Review)
+                render_tribunal_section(issue, repo)
                 
                 # FEATURE 3: The Interrogation Room (Refine Plan)
                 render_interrogation_room(issue, repo, db)
@@ -1089,6 +1187,147 @@ def run_execute_action(repo, issue, db):
 
     except Exception as e:
         st.error(f"Execution Failed: {str(e)}")
+
+
+def render_wanted_tab(selected_repo):
+    """Render the Wanted List (Tech Debt Scanner) tab."""
+    st.subheader("📜 The Wanted List - Tech Debt Scanner")
+    st.caption("Scan your local repository for TODO, FIXME, and other tech debt markers.")
+    
+    st.markdown("---")
+    st.markdown("**Enter Local Repository Path**")
+    st.caption("This should be the path to a local clone of your repository.")
+    
+    default_path = f"/home/ubuntu/repos/{selected_repo.name}"
+    repo_path = st.text_input("Local Repo Path", value=default_path, key="wanted_repo_path")
+    
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        scan_button = st.button("🔍 Scan for TODOs", type="primary", use_container_width=True)
+    
+    if scan_button:
+        with st.spinner("Scanning repository for tech debt..."):
+            todos = scan_for_todos(repo_path)
+            st.session_state.wanted_todos = todos
+            st.session_state.wanted_repo_path = repo_path
+    
+    if 'wanted_todos' in st.session_state and st.session_state.wanted_todos:
+        todos = st.session_state.wanted_todos
+        
+        st.success(f"Found {len(todos)} tech debt items!")
+        
+        tag_counts = {}
+        for t in todos:
+            tag_counts[t['tag']] = tag_counts.get(t['tag'], 0) + 1
+        
+        cols = st.columns(len(tag_counts))
+        for i, (tag, count) in enumerate(tag_counts.items()):
+            cols[i].metric(tag, count)
+        
+        st.markdown("---")
+        
+        for idx, todo in enumerate(todos[:50]):
+            with st.container():
+                col1, col2, col3 = st.columns([3, 1, 1])
+                
+                with col1:
+                    tag_color = {"TODO": "blue", "FIXME": "red", "XXX": "orange", "HACK": "orange", "BUG": "red"}.get(todo['tag'], "gray")
+                    st.markdown(f"**:{tag_color}[{todo['tag']}]** `{todo['file']}:{todo['line']}`")
+                    st.caption(todo['comment'])
+                
+                with col2:
+                    st.caption(f"Line {todo['line']}")
+                
+                with col3:
+                    if st.button("⭐ Create Issue", key=f"create_issue_{idx}", use_container_width=True):
+                        title = f"Refactor: {todo['comment'][:50]}..."
+                        body = (
+                            f"**Tech Debt Found by Sheriff**\n\n"
+                            f"**Type:** {todo['tag']}\n"
+                            f"**File:** `{todo['file']}`\n"
+                            f"**Line:** {todo['line']}\n\n"
+                            f"**Comment:**\n```\n{todo['comment']}\n```\n\n"
+                            f"---\n*Created by Devin Sheriff's Wanted List scanner*"
+                        )
+                        
+                        try:
+                            cfg = load_config()
+                            gh = GitHubClient(cfg)
+                            result = gh.create_issue(selected_repo.owner, selected_repo.name, title, body)
+                            
+                            if result["success"]:
+                                st.toast(f"Issue #{result['issue_number']} created!", icon="⭐")
+                                sync_repo_issues(selected_repo.url)
+                                invalidate_cache()
+                                time.sleep(1)
+                                st.rerun()
+                            else:
+                                st.error(result["error"])
+                        except Exception as e:
+                            st.error(f"Failed to create issue: {e}")
+                
+                st.markdown("---")
+        
+        if len(todos) > 50:
+            st.info(f"Showing first 50 of {len(todos)} items. Clean up some tech debt!")
+    
+    elif 'wanted_todos' in st.session_state and not st.session_state.wanted_todos:
+        st.success("No tech debt found! Your codebase is clean.")
+
+
+def render_tribunal_section(issue, repo):
+    """Render The Tribunal (Plan Review) section."""
+    st.markdown("---")
+    st.markdown("### ⚖️ The Tribunal - Plan Review")
+    st.caption("Get an AI-powered grade on your plan before execution.")
+    
+    if 'tribunal_result' not in st.session_state:
+        st.session_state.tribunal_result = None
+    
+    col1, col2 = st.columns([1, 3])
+    
+    with col1:
+        if st.button("⚖️ Convene Tribunal", type="secondary", use_container_width=True):
+            with st.spinner("The Tribunal is reviewing the plan..."):
+                try:
+                    cfg = load_config()
+                    client = DevinClient(cfg)
+                    result = client.start_tribunal_session(issue.scope_json)
+                    st.session_state.tribunal_result = result
+                except Exception as e:
+                    st.error(f"Tribunal failed: {e}")
+    
+    if st.session_state.tribunal_result:
+        result = st.session_state.tribunal_result
+        
+        if "error" in result and result.get("grade") == "?":
+            st.error(f"Tribunal error: {result.get('error')}")
+        else:
+            grade = result.get("grade", "?")
+            grade_color = get_tribunal_grade_color(grade)
+            
+            st.markdown(f"## Grade: :{grade_color}[{grade}]")
+            
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Safety", f"{result.get('safety_score', '?')}/10")
+            col2.metric("Efficiency", f"{result.get('efficiency_score', '?')}/10")
+            col3.metric("Completeness", f"{result.get('completeness_score', '?')}/10")
+            
+            if result.get("critique"):
+                st.markdown("**Critique:**")
+                st.info(result["critique"])
+            
+            if result.get("recommendations"):
+                st.markdown("**Recommendations:**")
+                for rec in result["recommendations"]:
+                    st.markdown(f"- {rec}")
+            
+            if grade in ["D", "F"]:
+                st.warning("⚠️ **Tribunal advises against execution.** Consider refining the plan first.")
+            
+            if st.button("🔄 Clear Tribunal Result"):
+                st.session_state.tribunal_result = None
+                st.rerun()
 
 
 if __name__ == "__main__":

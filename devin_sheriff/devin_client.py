@@ -244,6 +244,49 @@ class DevinClient:
             logger.error(f"Re-Scope Session Failed: {e}")
             raise e
 
+    def start_tribunal_session(self, plan_json: dict) -> Dict[str, Any]:
+        """
+        The Tribunal: A specialized AI step to grade the plan before execution.
+        Returns a grade (A-F) and critique on Safety, Efficiency, and Completeness.
+        Uses a shorter timeout (2 minutes) since this is a quick review task.
+        """
+        system_prompt = (
+            "You are a Senior Code Reviewer on 'The Tribunal'. Your job is to GRADE an action plan.\n"
+            "Analyze the following JSON plan and evaluate it on three criteria:\n"
+            "1. SAFETY: Does it avoid touching sensitive files? Are there risks?\n"
+            "2. EFFICIENCY: Is the plan concise? Are there unnecessary steps?\n"
+            "3. COMPLETENESS: Does it address the full scope of the issue?\n\n"
+            "Return a JSON object with this EXACT structure:\n"
+            "{\n"
+            '  "grade": "B",\n'
+            '  "safety_score": 8,\n'
+            '  "efficiency_score": 7,\n'
+            '  "completeness_score": 9,\n'
+            '  "critique": "Brief explanation of the grade and any concerns",\n'
+            '  "recommendations": ["suggestion 1", "suggestion 2"]\n'
+            "}\n"
+            "Grade scale: A (excellent), B (good), C (acceptable), D (risky), F (dangerous).\n"
+            "Return ONLY raw JSON. No markdown formatting."
+        )
+        
+        payload = {
+            "prompt": f"{system_prompt}\n\nPLAN TO REVIEW:\n{json.dumps(plan_json, indent=2)}",
+            "idempotent": True
+        }
+        
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                resp = client.post(f"{self.base_url}/sessions", json=payload, headers=self.headers)
+                resp.raise_for_status()
+                session_id = resp.json()["session_id"]
+                logger.info(f"⚖️ Started Tribunal Session: {session_id}")
+                
+                final_data = self._wait_for_session(session_id, timeout_seconds=120)
+                return self._extract_last_json(final_data)
+        except Exception as e:
+            logger.error(f"Tribunal Session Failed: {e}")
+            return {"error": str(e), "grade": "?"}
+
     def start_execute_session(self, repo_url: str, issue_number: int, title: str, plan_json: dict,
                               ci_failure_context: Optional[str] = None):
         """

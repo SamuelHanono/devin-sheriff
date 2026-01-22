@@ -227,6 +227,52 @@ class GitHubClient:
             logger.error(f"Failed to fetch check run logs: {e}")
             return None
 
+    def create_issue(self, owner: str, repo: str, title: str, body: str) -> Dict[str, Any]:
+        """
+        Create a new issue on GitHub.
+        Returns a dict with 'success', 'issue_number', and 'url' on success,
+        or 'success': False and 'error' on failure.
+        """
+        url = f"{self.base_url}/repos/{owner}/{repo}/issues"
+        payload = {
+            "title": title,
+            "body": body
+        }
+        
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                resp = client.post(url, headers=self.headers, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+                logger.info(f"Created issue #{data.get('number')}: {title[:50]}...")
+                return {
+                    "success": True,
+                    "issue_number": data.get("number"),
+                    "url": data.get("html_url")
+                }
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 403:
+                return {
+                    "success": False,
+                    "error": "Permission Denied. Your GitHub Token needs 'repo' scope to create issues."
+                }
+            elif e.response.status_code == 404:
+                return {
+                    "success": False,
+                    "error": f"Repository '{owner}/{repo}' not found."
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": f"GitHub API error: {e.response.status_code}"
+                }
+        except Exception as e:
+            logger.error(f"Failed to create issue: {e}")
+            return {
+                "success": False,
+                "error": f"Connection error: {str(e)}"
+            }
+
     def fetch_open_issues(self, owner: str, repo: str) -> List[Dict[str, Any]]:
         """Fetch all open issues for a repo (handles pagination)."""
         url = f"{self.base_url}/repos/{owner}/{repo}/issues"
