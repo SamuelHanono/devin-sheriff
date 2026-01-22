@@ -137,6 +137,51 @@ class DevinClient:
             logger.error(f"Scope Session Failed: {e}")
             raise e
 
+    def start_rescope_session(self, repo_url: str, issue_number: int, title: str, body: str, 
+                               previous_plan: dict, refinement_notes: str):
+        """
+        Re-scope an issue with user refinement notes.
+        This passes the previous plan and user's feedback to generate a better plan.
+        """
+        system_prompt = (
+            "You are a Senior Software Architect. Your goal is to RE-SCOPE a GitHub issue based on user feedback.\n"
+            f"1. Clone the repository: {repo_url}\n"
+            "2. Review the PREVIOUS PLAN that was generated:\n"
+            f"{json.dumps(previous_plan, indent=2)}\n\n"
+            "3. The user has provided the following REFINEMENT NOTES:\n"
+            f'"{refinement_notes}"\n\n'
+            "4. Generate a NEW, IMPROVED plan that incorporates the user's feedback.\n"
+            "5. Return a JSON object with this EXACT structure:\n"
+            "{\n"
+            '  "summary": "Brief summary of the problem",\n'
+            '  "files_to_change": ["list", "of", "files"],\n'
+            '  "action_plan": ["step 1", "step 2", "step 3"],\n'
+            '  "confidence": 85,\n'
+            '  "refinement_applied": "Brief note on how user feedback was incorporated"\n'
+            "}\n"
+            "Return ONLY raw JSON. No markdown formatting."
+        )
+
+        user_message = f"Issue #{issue_number}: {title}\n\n{body}"
+
+        payload = {
+            "prompt": f"{system_prompt}\n\nOriginal Issue: {user_message}",
+            "idempotent": True 
+        }
+
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                resp = client.post(f"{self.base_url}/sessions", json=payload, headers=self.headers)
+                resp.raise_for_status()
+                session_id = resp.json()["session_id"]
+                logger.info(f"🔄 Started Re-Scope Session: {session_id}")
+                
+                final_data = self._wait_for_session(session_id, timeout_seconds=300)
+                return self._extract_last_json(final_data)
+        except Exception as e:
+            logger.error(f"Re-Scope Session Failed: {e}")
+            raise e
+
     def start_execute_session(self, repo_url: str, issue_number: int, title: str, plan_json: dict):
         """
         Starts an Execution session. Timeout: 10 minutes.

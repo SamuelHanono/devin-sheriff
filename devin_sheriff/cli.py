@@ -204,5 +204,87 @@ def remove(repo_name: str):
     finally:
         db.close()
 
+@app.command()
+def patrol():
+    """
+    🌙 The Night Watch: Auto-scope all NEW issues across connected repos.
+    Run this, grab coffee, and come back to a dashboard full of ready-to-execute plans.
+    """
+    config = load_config()
+    if not config.github_token or not config.devin_api_key:
+        print_error("Configuration missing. Run 'python main.py setup' first.")
+        raise typer.Exit(code=1)
+
+    db = get_db()
+    try:
+        repos = db.query(Repo).all()
+        if not repos:
+            print_warning("No repositories connected. Run 'python main.py connect <url>' first.")
+            return
+
+        # Collect all NEW issues across all repos
+        new_issues = []
+        for repo in repos:
+            issues = db.query(Issue).filter(
+                Issue.repo_id == repo.id,
+                Issue.status == "NEW",
+                Issue.state == "open"
+            ).all()
+            for issue in issues:
+                new_issues.append((repo, issue))
+
+        if not new_issues:
+            print_warning("No NEW issues found. All issues are already scoped or closed.")
+            return
+
+        typer.echo(typer.style(f"\n🌙 THE NIGHT WATCH", fg=typer.colors.CYAN, bold=True))
+        typer.echo(f"Found {len(new_issues)} issue(s) to scope.\n")
+        typer.echo("-" * 50)
+
+        # Initialize Devin client
+        devin = DevinClient(config)
+
+        scoped_count = 0
+        failed_count = 0
+
+        for idx, (repo, issue) in enumerate(new_issues, 1):
+            typer.echo(f"\n[{idx}/{len(new_issues)}] Scoping: {repo.owner}/{repo.name} #{issue.number}")
+            typer.echo(f"   Title: {issue.title[:60]}...")
+            
+            try:
+                typer.echo("   ⏳ Devin is analyzing... (this may take 1-3 minutes)")
+                
+                plan = devin.start_scope_session(
+                    repo.url,
+                    issue.number,
+                    issue.title,
+                    issue.body or ""
+                )
+                
+                # Update issue in database
+                issue.scope_json = plan
+                issue.confidence = plan.get("confidence", 0)
+                issue.status = "SCOPED"
+                db.commit()
+                
+                print_success(f"Scoped! Confidence: {issue.confidence}%")
+                scoped_count += 1
+                
+            except Exception as e:
+                print_error(f"Failed: {str(e)[:80]}")
+                failed_count += 1
+                continue
+
+        # Summary
+        typer.echo("\n" + "=" * 50)
+        typer.echo(typer.style("🌙 PATROL COMPLETE", fg=typer.colors.CYAN, bold=True))
+        typer.echo(f"   Scoped: {scoped_count}")
+        typer.echo(f"   Failed: {failed_count}")
+        typer.echo(f"\nRun 'streamlit run devin_sheriff/dashboard.py' to review plans.")
+
+    finally:
+        db.close()
+
+
 if __name__ == "__main__":
     app()

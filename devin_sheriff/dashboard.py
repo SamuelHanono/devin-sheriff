@@ -205,6 +205,54 @@ class AsyncTaskRunner:
 if 'task_runner' not in st.session_state:
     st.session_state.task_runner = AsyncTaskRunner()
 
+# --- RISK ANALYSIS HELPER ---
+def analyze_risk_level(files_to_change: list) -> tuple:
+    """
+    Analyze the risk level based on files being changed.
+    Returns (risk_level, risk_color, risk_description)
+    """
+    if not files_to_change:
+        return ("UNKNOWN", "gray", "No files specified in plan")
+    
+    high_risk_patterns = [
+        'config.py', '.env', 'secrets', 'credentials', 'auth', 
+        'password', 'token', 'key', 'private', 'secret',
+        'settings.py', 'config.json', 'config.yaml', 'config.yml',
+        '.pem', '.key', 'oauth', 'jwt'
+    ]
+    
+    medium_risk_patterns = [
+        'main.py', 'models.py', 'app.py', 'database', 'db.py',
+        'core/', 'src/main', 'index.py', 'server.py', 'api.py',
+        'routes.py', 'views.py', 'schema', 'migration'
+    ]
+    
+    low_risk_patterns = [
+        'readme', 'test', '.txt', '.md', 'docs/', 'doc/',
+        'example', 'sample', '.rst', 'changelog', 'license',
+        'contributing', '.gitignore', 'requirements.txt'
+    ]
+    
+    files_lower = [f.lower() for f in files_to_change]
+    
+    for file in files_lower:
+        for pattern in high_risk_patterns:
+            if pattern in file:
+                return ("HIGH", "red", f"Touches sensitive file: {file}")
+    
+    for file in files_lower:
+        for pattern in medium_risk_patterns:
+            if pattern in file:
+                return ("MEDIUM", "orange", f"Modifies core logic: {file}")
+    
+    for file in files_lower:
+        for pattern in low_risk_patterns:
+            if pattern in file:
+                return ("LOW", "green", "Only touches docs/tests")
+    
+    return ("MEDIUM", "orange", "Standard code changes")
+
+
 # --- LOG VIEWER HELPER ---
 def read_log_file(num_lines: int = 50) -> str:
     """Read the last N lines from the log file."""
@@ -432,9 +480,20 @@ def render_issue_workspace(issue, repo, db):
         if issue.scope_json:
             st.success(f"**Plan Ready** (Confidence: {issue.confidence}%)")
             
+            # FEATURE 2: Risk Level Badge (Suspect Profiling)
+            files_to_change = issue.scope_json.get("files_to_change", [])
+            risk_level, risk_color, risk_desc = analyze_risk_level(files_to_change)
+            
+            risk_emoji = {"HIGH": "🔴", "MEDIUM": "🟠", "LOW": "🟢", "UNKNOWN": "⚪"}.get(risk_level, "⚪")
+            st.markdown(f"**Risk Level:** {risk_emoji} :{risk_color}[{risk_level}]")
+            st.caption(risk_desc)
+            
             # Plan Editor Feature for SCOPED issues
             if issue.status == "SCOPED":
                 render_plan_editor(issue, db)
+                
+                # FEATURE 3: The Interrogation Room (Refine Plan)
+                render_interrogation_room(issue, repo, db)
             else:
                 with st.expander("📋 View Action Plan", expanded=True):
                     render_plan_display(issue.scope_json)
@@ -605,6 +664,56 @@ def render_plan_editor(issue, db):
         
         if st.session_state.get('edited_plan'):
             st.warning("Using edited plan (not saved to database)")
+
+
+def render_interrogation_room(issue, repo, db):
+    """
+    Feature 3: The Interrogation Room - Refine plans with natural language feedback.
+    Allows users to provide instructions to improve the generated plan.
+    """
+    with st.expander("👮 Interrogation Room (Refine Plan)", expanded=False):
+        st.info("💡 **Refine the plan:** Provide instructions to improve Devin's approach. "
+                "Example: 'Don't touch main.py, create a helper file instead.'")
+        
+        refinement_notes = st.text_area(
+            "Your refinement instructions:",
+            placeholder="e.g., 'Focus only on the API layer, don't modify the database models.'",
+            height=100,
+            key=f"interrogate_{issue.id}"
+        )
+        
+        if st.button("🔄 Re-Scope with Feedback", key=f"refine_{issue.id}", type="primary", use_container_width=True):
+            if not refinement_notes.strip():
+                st.warning("Please provide refinement instructions first.")
+            else:
+                with st.spinner("👮 Interrogating Devin with your feedback... (1-3 minutes)"):
+                    try:
+                        cfg = load_config()
+                        client = DevinClient(cfg)
+                        
+                        new_plan = client.start_rescope_session(
+                            repo.url,
+                            issue.number,
+                            issue.title,
+                            issue.body or "",
+                            issue.scope_json,
+                            refinement_notes
+                        )
+                        
+                        issue.scope_json = new_plan
+                        issue.confidence = new_plan.get("confidence", 0)
+                        db.commit()
+                        invalidate_cache()
+                        
+                        st.success("Plan refined successfully!")
+                        if new_plan.get("refinement_applied"):
+                            st.info(f"📝 {new_plan['refinement_applied']}")
+                        time.sleep(1)
+                        st.rerun()
+                        
+                    except Exception as e:
+                        st.error(f"Re-scope failed: {str(e)}")
+                        logger.error(f"Interrogation failed for issue #{issue.number}: {e}")
 
 
 def handle_task_completion(issue, task_runner, db):
