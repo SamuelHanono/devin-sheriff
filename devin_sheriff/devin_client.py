@@ -43,8 +43,10 @@ class DevinClient:
                     # Log for debugging (prints to terminal)
                     print(f"Session {session_id} status: {status}")
 
-                    if status in ["stopped", "completed", "terminated", "blocked"]:
+                    # --- FIXED: Added "finished" to this list ---
+                    if status in ["stopped", "completed", "terminated", "blocked", "finished"]:
                         return data
+                    # --------------------------------------------
                     
                     if status == "error":
                          raise Exception(f"Devin Session Error: {data}")
@@ -134,7 +136,10 @@ class DevinClient:
             f"1. Clone the repository: {repo_url}\n"
             f"2. Follow this PLAN exactly:\n{json.dumps(plan_json)}\n"
             "3. Create a branch, commit changes, and push.\n"
-            "4. Return JSON: { \"pr_url\": \"...\", \"summary\": \"...\" }"
+            # --- FIXED: Added instruction to auto-close issue ---
+            f"4. Open a PR and ensure the description says 'Closes #{issue_number}' to link it.\n"
+            # ----------------------------------------------------
+            "5. Return JSON: { \"pr_url\": \"...\", \"summary\": \"...\" }"
         )
 
         payload = {
