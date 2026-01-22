@@ -70,7 +70,7 @@ pip install -r requirements.txt
 
 2. **Run the interactive setup:**
 ```bash
-python main.py setup
+python3 main.py setup
 
 ```
 
@@ -102,7 +102,7 @@ Verifying Devin connection...
 Tell Devin Sheriff which repository you want to work on.
 
 ```bash
-python main.py connect https://github.com/owner/repo-name
+python3 main.py connect https://github.com/owner/repo-name
 
 ```
 
