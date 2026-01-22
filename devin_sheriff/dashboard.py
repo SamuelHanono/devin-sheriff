@@ -480,6 +480,174 @@ def get_tribunal_grade_color(grade: str) -> str:
     return grade_colors.get(grade.upper(), "gray")
 
 
+# --- MISSION LOG HELPER ---
+def get_mission_log_entries(num_entries: int = 20) -> List[Dict[str, Any]]:
+    """Get recent log entries formatted for the Mission Log display."""
+    entries = []
+    try:
+        if not LOG_FILE.exists():
+            return [{"time": datetime.now().strftime("%H:%M:%S"), "level": "INFO", "message": "Mission Log initialized. Waiting for activity..."}]
+        
+        with open(LOG_FILE, 'r') as f:
+            lines = f.readlines()[-num_entries:]
+            for line in lines:
+                parts = line.strip().split(' - ', 3)
+                if len(parts) >= 4:
+                    timestamp = parts[0].split(' ')[-1] if ' ' in parts[0] else parts[0]
+                    level = parts[2] if len(parts) > 2 else "INFO"
+                    message = parts[3] if len(parts) > 3 else line.strip()
+                    entries.append({
+                        "time": timestamp[:8],
+                        "level": level,
+                        "message": message[:100]
+                    })
+                else:
+                    entries.append({
+                        "time": datetime.now().strftime("%H:%M:%S"),
+                        "level": "INFO",
+                        "message": line.strip()[:100]
+                    })
+    except Exception as e:
+        entries.append({"time": datetime.now().strftime("%H:%M:%S"), "level": "ERROR", "message": f"Log read error: {e}"})
+    
+    return entries if entries else [{"time": datetime.now().strftime("%H:%M:%S"), "level": "INFO", "message": "No activity yet."}]
+
+
+# --- FIRST-RUN WIZARD ---
+def render_first_run_wizard():
+    """Render a friendly welcome screen for first-time users."""
+    st.markdown("""
+    <style>
+        .welcome-container {
+            text-align: center;
+            padding: 40px 20px;
+        }
+        .welcome-title {
+            font-size: 3em;
+            margin-bottom: 10px;
+        }
+        .welcome-subtitle {
+            font-size: 1.2em;
+            color: #888;
+            margin-bottom: 30px;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    st.markdown('<div class="welcome-container">', unsafe_allow_html=True)
+    st.markdown("# 🤠 Welcome to Devin Sheriff!")
+    st.markdown("### Your AI-Powered Issue Management Partner")
+    st.markdown("</div>", unsafe_allow_html=True)
+    
+    st.markdown("---")
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col2:
+        st.markdown("#### Connect Your First Repository")
+        st.markdown("Paste a GitHub repository URL below to get started. Devin Sheriff works with **any** public or private repository you have access to.")
+        
+        repo_url = st.text_input(
+            "GitHub Repository URL",
+            placeholder="https://github.com/your-username/your-repo",
+            help="Enter the full URL of your GitHub repository"
+        )
+        
+        if st.button("🚀 Connect Repository", type="primary", use_container_width=True):
+            if not repo_url:
+                st.error("Please enter a repository URL.")
+            elif "github.com" not in repo_url:
+                st.error("Please enter a valid GitHub URL (must contain 'github.com').")
+            else:
+                with st.spinner("Connecting to repository..."):
+                    result = connect_repo_from_dashboard(repo_url)
+                    if result["success"]:
+                        st.success(f"Successfully connected to **{result['repo_name']}**!")
+                        st.balloons()
+                        invalidate_cache()
+                        time.sleep(2)
+                        st.rerun()
+                    else:
+                        st.error(result["error"])
+        
+        st.markdown("---")
+        
+        st.markdown("#### Quick Setup Checklist")
+        config = load_config()
+        
+        gh_status = "configured" if config.github_token else "missing"
+        devin_status = "configured" if config.devin_api_key else "missing"
+        
+        if config.github_token:
+            st.markdown("- [x] GitHub Token configured")
+        else:
+            st.markdown("- [ ] GitHub Token **not configured**")
+            st.caption("Run `python main.py setup` in your terminal to configure.")
+        
+        if config.devin_api_key:
+            st.markdown("- [x] Devin API Key configured")
+        else:
+            st.markdown("- [ ] Devin API Key **not configured**")
+            st.caption("Run `python main.py setup` in your terminal to configure.")
+        
+        if not config.is_complete():
+            st.warning("Please complete the setup before connecting a repository.")
+            st.code("python main.py setup", language="bash")
+    
+    render_danger_zone()
+
+
+def connect_repo_from_dashboard(repo_url: str) -> Dict[str, Any]:
+    """Connect a repository directly from the dashboard."""
+    import re
+    
+    config = load_config()
+    if not config.github_token:
+        return {"success": False, "error": "GitHub Token not configured. Run 'python main.py setup' first."}
+    
+    match = re.search(r"github\.com/([^/]+)/([^/]+)", repo_url)
+    if not match:
+        return {"success": False, "error": "Invalid GitHub URL. Must be in format: github.com/owner/repo"}
+    
+    owner, repo_name = match.groups()
+    repo_name = repo_name.replace(".git", "").rstrip("/")
+    
+    try:
+        gh = GitHubClient(config)
+        gh.get_repo_details(owner, repo_name)
+    except Exception as e:
+        error_msg = str(e)
+        if "not found" in error_msg.lower() or "404" in error_msg:
+            return {"success": False, "error": f"Repository '{owner}/{repo_name}' not found. Check the URL and ensure you have access."}
+        elif "401" in error_msg or "unauthorized" in error_msg.lower():
+            return {"success": False, "error": "GitHub authentication failed. Your token may be invalid or expired."}
+        else:
+            return {"success": False, "error": f"Could not connect to repository: {error_msg}"}
+    
+    db = get_db()
+    try:
+        existing = db.query(Repo).filter(Repo.owner == owner, Repo.name == repo_name).first()
+        if existing:
+            return {"success": True, "repo_name": f"{owner}/{repo_name}", "message": "Repository already connected."}
+        
+        clean_url = f"https://github.com/{owner}/{repo_name}"
+        repo = Repo(url=clean_url, owner=owner, name=repo_name)
+        db.add(repo)
+        db.commit()
+        
+        try:
+            sync_repo_issues(clean_url)
+        except Exception as sync_error:
+            logger.warning(f"Initial sync failed: {sync_error}")
+        
+        return {"success": True, "repo_name": f"{owner}/{repo_name}"}
+    except Exception as e:
+        db.rollback()
+        return {"success": False, "error": f"Database error: {str(e)}"}
+    finally:
+        db.close()
+
+
 # --- MAIN DASHBOARD LOGIC ---
 def main():
     st.title("🤠 Devin Sheriff v2.0")
@@ -488,10 +656,9 @@ def main():
     st.sidebar.header("📂 Repository")
     repos = get_cached_repos()
     
+    # FEATURE A: First-Run Wizard
     if not repos:
-        st.sidebar.warning("No repositories connected.")
-        st.sidebar.info("Run `python main.py connect <url>` in your terminal.")
-        render_danger_zone()
+        render_first_run_wizard()
         return
 
     repo_names = [r.name for r in repos]
@@ -565,17 +732,125 @@ def main():
     render_danger_zone()
     
     # 3. MAIN CONTENT AREA WITH TABS
-    tab_main, tab_laws = st.tabs(["🛠 Issue Management", "👮‍♂️ Laws"])
+    tab_main, tab_laws, tab_log = st.tabs(["🛠 Mission Control", "👮‍♂️ Sheriff's Rules", "📡 Live Mission Log"])
     
     with tab_main:
-        render_main_dashboard(selected_repo, filter_status)
+        render_mission_control(selected_repo, filter_status)
     
     with tab_laws:
         render_laws_tab()
+    
+    with tab_log:
+        render_live_mission_log()
 
 
-def render_main_dashboard(selected_repo, filter_status):
-    """Render the main issue management dashboard."""
+# --- FEATURE C: LIVE MISSION LOG ---
+def render_live_mission_log():
+    """Render the Live Mission Log - a real-time scrolling terminal view of system activity."""
+    st.subheader("📡 Live Mission Log")
+    st.caption("Real-time view of Sheriff activity. Auto-refreshes every 5 seconds when enabled.")
+    
+    col1, col2, col3 = st.columns([2, 1, 1])
+    
+    with col1:
+        auto_refresh = st.checkbox("Auto-refresh", value=False, key="mission_log_auto_refresh")
+    
+    with col2:
+        num_lines = st.selectbox("Lines to show", [20, 50, 100, 200], index=1)
+    
+    with col3:
+        if st.button("🔄 Refresh Now", use_container_width=True):
+            st.rerun()
+    
+    st.markdown("---")
+    
+    log_entries = get_mission_log_entries(num_lines)
+    
+    log_html = """
+    <style>
+        .mission-log {
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            background-color: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 15px;
+            max-height: 500px;
+            overflow-y: auto;
+            color: #c9d1d9;
+        }
+        .log-entry {
+            margin: 2px 0;
+            padding: 2px 5px;
+            border-radius: 3px;
+        }
+        .log-time {
+            color: #8b949e;
+            margin-right: 10px;
+        }
+        .log-level-INFO { color: #58a6ff; }
+        .log-level-WARNING { color: #d29922; }
+        .log-level-ERROR { color: #f85149; }
+        .log-level-DEBUG { color: #8b949e; }
+        .log-message { color: #c9d1d9; }
+    </style>
+    <div class="mission-log">
+    """
+    
+    for entry in log_entries:
+        level_class = f"log-level-{entry['level']}"
+        log_html += f"""
+        <div class="log-entry">
+            <span class="log-time">[{entry['time']}]</span>
+            <span class="{level_class}">[{entry['level']}]</span>
+            <span class="log-message">{entry['message']}</span>
+        </div>
+        """
+    
+    log_html += "</div>"
+    
+    st.markdown(log_html, unsafe_allow_html=True)
+    
+    if auto_refresh:
+        time.sleep(5)
+        st.rerun()
+    
+    st.markdown("---")
+    st.markdown("**Log File Location:**")
+    st.code(str(LOG_FILE), language=None)
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("📥 Download Full Log", use_container_width=True):
+            try:
+                if LOG_FILE.exists():
+                    log_content = LOG_FILE.read_text()
+                    st.download_button(
+                        label="Click to Download",
+                        data=log_content,
+                        file_name="sheriff.log",
+                        mime="text/plain"
+                    )
+                else:
+                    st.warning("No log file found yet.")
+            except Exception as e:
+                st.error(f"Error reading log: {e}")
+    
+    with col2:
+        if st.button("🗑️ Clear Log File", use_container_width=True):
+            try:
+                if LOG_FILE.exists():
+                    LOG_FILE.write_text("")
+                    st.success("Log file cleared!")
+                    time.sleep(1)
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Error clearing log: {e}")
+
+
+# --- MISSION CONTROL: 3-COLUMN LAYOUT ---
+def render_mission_control(selected_repo, filter_status):
+    """Render the Mission Control dashboard with 3-column layout for high data density."""
     db = get_db()
     
     try:
@@ -587,11 +862,14 @@ def render_main_dashboard(selected_repo, filter_status):
         count_new = len([i for i in all_issues if i.status == "NEW"])
         count_scoped = len([i for i in all_issues if i.status == "SCOPED"])
         count_pr = len([i for i in all_issues if i.status == "PR_OPEN"])
+        count_executing = len([i for i in all_issues if i.status == "EXECUTING"])
 
-        m1, m2, m3 = st.columns(3)
-        m1.metric("New Issues", count_new)
-        m2.metric("Scoped & Planned", count_scoped)
-        m3.metric("PRs Open", count_pr)
+        st.markdown("### 📊 Status Overview")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("🆕 New", count_new)
+        m2.metric("📋 Scoped", count_scoped)
+        m3.metric("⚙️ Executing", count_executing)
+        m4.metric("🚀 PRs Open", count_pr)
 
         st.divider()
 
@@ -606,23 +884,203 @@ def render_main_dashboard(selected_repo, filter_status):
 
         if not display_issues:
             st.info(f"No issues found matching filter: **{filter_status}**")
+            st.markdown("---")
+            st.markdown("#### Quick Actions")
+            if st.button("🔄 Sync Issues from GitHub", use_container_width=True):
+                with st.spinner("Syncing..."):
+                    msg = sync_repo_issues(selected_repo.url)
+                    invalidate_cache()
+                    st.success(msg)
+                    time.sleep(1)
+                    st.rerun()
             return
 
-        st.subheader(f"🛠 Managing Issues ({len(display_issues)})")
+        col_list, col_detail, col_actions = st.columns([1, 2, 1])
         
-        issue_options = {f"#{i.number}: {i.title} [{i.status}]": i.number for i in display_issues}
-        selected_label = st.selectbox("Select an Issue to work on:", options=list(issue_options.keys()))
+        with col_list:
+            st.markdown("#### 📋 Issue Queue")
+            
+            issue_options = {f"#{i.number}: {i.title[:30]}..." if len(i.title) > 30 else f"#{i.number}: {i.title}": i.number for i in display_issues}
+            
+            for label, num in issue_options.items():
+                issue = next((i for i in display_issues if i.number == num), None)
+                if issue:
+                    status_emoji = {
+                        "NEW": "🆕",
+                        "SCOPED": "📋",
+                        "EXECUTING": "⚙️",
+                        "PR_OPEN": "🚀",
+                        "DONE": "✅",
+                        "FAILED": "❌"
+                    }.get(issue.status, "❓")
+                    
+                    is_selected = st.session_state.get('selected_issue_number') == num
+                    button_type = "primary" if is_selected else "secondary"
+                    
+                    if st.button(f"{status_emoji} #{issue.number}", key=f"issue_btn_{num}", use_container_width=True, type=button_type):
+                        st.session_state.selected_issue_number = num
+                        st.rerun()
+            
+            if 'selected_issue_number' not in st.session_state and display_issues:
+                st.session_state.selected_issue_number = display_issues[0].number
         
-        if selected_label:
-            selected_number = issue_options[selected_label]
+        selected_number = st.session_state.get('selected_issue_number')
+        current_issue = None
+        if selected_number:
             current_issue = db.query(Issue).filter(
                 Issue.repo_id == selected_repo.id, 
                 Issue.number == selected_number
             ).first()
-
-            render_issue_workspace(current_issue, selected_repo, db)
+        
+        with col_detail:
+            if current_issue:
+                render_issue_detail_panel(current_issue, selected_repo, db)
+            else:
+                st.info("Select an issue from the queue to view details.")
+        
+        with col_actions:
+            if current_issue:
+                render_action_panel(current_issue, selected_repo, db)
+            else:
+                st.markdown("#### ⚡ Actions")
+                st.caption("Select an issue to see available actions.")
+                
     finally:
         db.close()
+
+
+def render_issue_detail_panel(issue, repo, db):
+    """Render the central detail panel for an issue."""
+    st.markdown(f"#### Issue #{issue.number}")
+    st.markdown(f"**{issue.title}**")
+    
+    status_colors = {
+        "NEW": "gray",
+        "SCOPED": "orange",
+        "EXECUTING": "blue",
+        "PR_OPEN": "green",
+        "DONE": "green",
+        "FAILED": "red"
+    }
+    status_color = status_colors.get(issue.status, "gray")
+    st.markdown(f"Status: :{status_color}[**{issue.status}**]")
+    
+    with st.expander("📖 Description", expanded=False):
+        st.markdown(issue.body if issue.body else "*No description provided.*")
+    
+    if issue.scope_json:
+        if "error" in issue.scope_json:
+            st.error(f"**Scoping Failed:** {issue.scope_json.get('error', 'Unknown error')}")
+        else:
+            st.success(f"**Plan Ready** (Confidence: {issue.confidence}%)")
+            
+            files_to_change = issue.scope_json.get("files_to_change", [])
+            risk_level, risk_color, risk_desc = analyze_risk_level(files_to_change)
+            risk_emoji = {"HIGH": "🔴", "MEDIUM": "🟠", "LOW": "🟢", "UNKNOWN": "⚪"}.get(risk_level, "⚪")
+            st.markdown(f"**Risk:** {risk_emoji} :{risk_color}[{risk_level}] - {risk_desc}")
+            
+            with st.expander("📋 Action Plan", expanded=True):
+                st.markdown("**Strategy:**")
+                for step in issue.scope_json.get("action_plan", []):
+                    st.markdown(f"- {step}")
+                
+                st.markdown("**Files to Change:**")
+                for f in files_to_change:
+                    st.code(f, language="bash")
+    
+    if issue.pr_url:
+        st.markdown("---")
+        st.success(f"🚀 [View Pull Request]({issue.pr_url})")
+        
+        ci_badge = get_ci_badge(issue.ci_status or "unknown", issue.retry_count or 0)
+        st.markdown(f"**CI Status:** {ci_badge}")
+
+
+def render_action_panel(issue, repo, db):
+    """Render the action panel for an issue."""
+    st.markdown("#### ⚡ Actions")
+    
+    task_runner = st.session_state.task_runner
+    
+    if task_runner.status == "completed":
+        handle_task_completion(issue, task_runner, db)
+        st.rerun()
+    elif task_runner.status == "failed":
+        st.error(f"Task failed: {task_runner.error}")
+        task_runner.status = "idle"
+    
+    if task_runner.is_running():
+        st.info("🔄 Task in progress...")
+        progress = task_runner.get_progress()
+        st.progress(progress / 100)
+        time.sleep(2)
+        st.rerun()
+    else:
+        if issue.status in ["NEW", "DONE"]:
+            if st.button("🔍 Scope Issue", key=f"scope_{issue.id}", type="primary", use_container_width=True):
+                task_runner.run_scope(repo.url, issue.number, issue.title, issue.body, repo_id=repo.id)
+                st.info("Scoping started...")
+                time.sleep(1)
+                st.rerun()
+        
+        if issue.status == "SCOPED":
+            if st.button("🛠 Execute Fix", key=f"exec_{issue.id}", type="primary", use_container_width=True):
+                plan_to_use = st.session_state.get('edited_plan') or issue.scope_json
+                task_runner.run_execute(repo.url, issue.number, issue.title, plan_to_use)
+                st.info("Execution started...")
+                time.sleep(1)
+                st.rerun()
+            
+            if st.button("🔄 Re-Scope", key=f"rescope_{issue.id}", use_container_width=True):
+                issue.status = "NEW"
+                issue.scope_json = None
+                issue.confidence = 0
+                st.session_state.edited_plan = None
+                db.commit()
+                invalidate_cache()
+                st.rerun()
+        
+        if issue.status == "PR_OPEN" and issue.pr_url:
+            if st.button("🔄 Check CI", key=f"check_ci_{issue.id}", use_container_width=True):
+                with st.spinner("Checking CI..."):
+                    ci_result = check_and_update_ci_status(issue, repo, db)
+                    if ci_result["status"] == "failing" and (issue.retry_count or 0) < 3:
+                        if st.button("🔧 Auto-Heal", key=f"heal_{issue.id}", type="primary"):
+                            heal_result = trigger_auto_heal(issue, repo, ci_result.get("failures", []), db)
+                            if "error" not in heal_result:
+                                plan_to_use = issue.scope_json or {}
+                                task_runner.run_execute(
+                                    repo.url, issue.number, issue.title, plan_to_use,
+                                    ci_failure_context=heal_result.get("failure_context")
+                                )
+                                st.rerun()
+                    st.rerun()
+    
+    st.markdown("---")
+    st.markdown("**Manual Controls**")
+    
+    if issue.status != "DONE":
+        if st.button("✅ Close Issue", key=f"close_{issue.id}", use_container_width=True):
+            result = close_issue_workflow(issue, repo, db, close_on_github=False)
+            st.success(f"Issue #{issue.number} closed!")
+            invalidate_cache()
+            time.sleep(1)
+            st.rerun()
+    
+    if st.button("🗑 Reset State", key=f"reset_{issue.id}", use_container_width=True):
+        issue.status = "NEW"
+        issue.scope_json = None
+        issue.confidence = None
+        issue.pr_url = None
+        st.session_state.edited_plan = None
+        db.commit()
+        invalidate_cache()
+        st.rerun()
+
+
+def render_main_dashboard(selected_repo, filter_status):
+    """Legacy function - redirects to Mission Control."""
+    render_mission_control(selected_repo, filter_status)
 
 
 def render_settings_security():

@@ -27,21 +27,23 @@ def sync_repo_issues(repo_url: str) -> str:
     2. Adds new issues to DB.
     3. Updates existing issues (title/body).
     4. Marks local issues as DONE if they are no longer in the GitHub list.
+    
+    Returns user-friendly error messages for common failure scenarios.
     """
     
     # 1. Setup & Configuration Check
     config = load_config()
     if not config.github_token:
         logger.error("Sync failed: No GitHub Token found.")
-        return "Error: No GitHub Token found. Run 'setup'."
+        return "Configuration Error: No GitHub Token found. Please run 'python main.py setup' to configure your credentials."
 
     # 2. Parse URL
     match = re.search(r"github\.com/([^/]+)/([^/]+)", repo_url)
     if not match:
-        return "Error: Invalid Repo URL. Must be 'github.com/owner/repo'."
+        return "Invalid URL: The repository URL must be in the format 'https://github.com/owner/repo'. Please check the URL and try again."
     
     owner, repo_name = match.groups()
-    repo_name = repo_name.replace(".git", "")
+    repo_name = repo_name.replace(".git", "").rstrip("/")
 
     # 3. Fetch Data from GitHub
     logger.info(f"Syncing {owner}/{repo_name}...")
@@ -49,8 +51,22 @@ def sync_repo_issues(repo_url: str) -> str:
         gh = GitHubClient(config)
         gh_issues = gh.fetch_open_issues(owner, repo_name)
     except Exception as e:
-        logger.error(f"GitHub API Error: {e}")
-        return f"GitHub API Error: {e}"
+        error_msg = str(e)
+        logger.error(f"GitHub API Error: {error_msg}")
+        
+        # Provide user-friendly error messages
+        if "404" in error_msg or "not found" in error_msg.lower():
+            return f"Repository Not Found: '{owner}/{repo_name}' does not exist or you don't have access. Please verify the URL and ensure your GitHub token has the necessary permissions."
+        elif "401" in error_msg or "unauthorized" in error_msg.lower():
+            return "Authentication Failed: Your GitHub token is invalid or has expired. Please run 'python main.py setup' to update your credentials."
+        elif "403" in error_msg or "forbidden" in error_msg.lower():
+            return "Access Denied: Your GitHub token doesn't have permission to access this repository. Ensure your token has 'repo' scope for private repositories."
+        elif "rate limit" in error_msg.lower():
+            return "Rate Limited: GitHub API rate limit exceeded. Please wait a few minutes and try again."
+        elif "timeout" in error_msg.lower() or "connection" in error_msg.lower():
+            return "Connection Error: Could not connect to GitHub. Please check your internet connection and try again."
+        else:
+            return f"GitHub Error: {error_msg}"
 
     # 4. Database Operations
     db: Session = SessionLocal()
@@ -141,14 +157,15 @@ def sync_pr_statuses(repo_url: str) -> Dict[str, Any]:
     """
     Enhanced sync that also checks PR statuses.
     Returns detailed stats about what was updated.
+    Provides user-friendly error messages for common failure scenarios.
     """
     config = load_config()
     if not config.github_token:
-        return {"error": "No GitHub Token found", "stats": {}}
+        return {"error": "Configuration Error: No GitHub Token found. Please run 'python main.py setup' to configure your credentials.", "stats": {}}
 
     match = re.search(r"github\.com/([^/]+)/([^/]+)", repo_url)
     if not match:
-        return {"error": "Invalid Repo URL", "stats": {}}
+        return {"error": "Invalid URL: The repository URL must be in the format 'https://github.com/owner/repo'.", "stats": {}}
     
     owner, repo_name = match.groups()
     repo_name = repo_name.replace(".git", "")
