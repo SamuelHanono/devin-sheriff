@@ -425,7 +425,7 @@ def render_issue_workspace(issue, repo, db):
     c1, c2 = st.columns([2, 1])
 
     with c1:
-        st.markdown(f"### {issue.title}")
+        st.markdown(f"### Issue #{issue.number}: {issue.title}")
         with st.expander("📖 View Issue Description", expanded=True):
             st.markdown(issue.body if issue.body else "*No description provided.*")
 
