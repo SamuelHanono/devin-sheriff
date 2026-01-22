@@ -133,6 +133,146 @@ class GitHubClient:
             logger.error(f"Failed to fetch PR #{pr_number}: {e}")
             return None
 
+    def get_pr_ci_status(self, owner: str, repo: str, pr_number: int) -> Dict[str, Any]:
+        """
+        Fetch the combined CI status for a PR's latest commit.
+        Returns: {
+            'status': 'passing' | 'failing' | 'pending' | 'unknown',
+            'total_count': int,
+            'failures': [{'name': str, 'description': str}],
+            'sha': str (commit SHA)
+        }
+        """
+        try:
+            pr = self.get_pull_request(owner, repo, pr_number)
+            if not pr:
+                return {"status": "unknown", "total_count": 0, "failures": [], "sha": None}
+            
+            head_sha = pr.get("head", {}).get("sha")
+            if not head_sha:
+                return {"status": "unknown", "total_count": 0, "failures": [], "sha": None}
+            
+            with httpx.Client(timeout=self.timeout) as client:
+                status_url = f"{self.base_url}/repos/{owner}/{repo}/commits/{head_sha}/status"
+                resp = client.get(status_url, headers=self.headers)
+                resp.raise_for_status()
+                status_data = resp.json()
+                
+                checks_url = f"{self.base_url}/repos/{owner}/{repo}/commits/{head_sha}/check-runs"
+                checks_resp = client.get(checks_url, headers=self.headers)
+                checks_resp.raise_for_status()
+                checks_data = checks_resp.json()
+            
+            combined_state = status_data.get("state", "unknown")
+            statuses = status_data.get("statuses", [])
+            check_runs = checks_data.get("check_runs", [])
+            
+            failures = []
+            pending_count = 0
+            
+            for s in statuses:
+                if s.get("state") == "failure":
+                    failures.append({
+                        "name": s.get("context", "Unknown"),
+                        "description": s.get("description", "No description")
+                    })
+                elif s.get("state") == "pending":
+                    pending_count += 1
+            
+            for run in check_runs:
+                conclusion = run.get("conclusion")
+                status = run.get("status")
+                if conclusion == "failure" or conclusion == "cancelled":
+                    failures.append({
+                        "name": run.get("name", "Unknown"),
+                        "description": run.get("output", {}).get("summary", "Check failed")
+                    })
+                elif status == "in_progress" or status == "queued":
+                    pending_count += 1
+            
+            if failures:
+                final_status = "failing"
+            elif pending_count > 0:
+                final_status = "pending"
+            elif combined_state == "success" or (not statuses and not check_runs):
+                final_status = "passing"
+            else:
+                final_status = combined_state
+            
+            total_count = len(statuses) + len(check_runs)
+            
+            logger.info(f"CI Status for PR #{pr_number}: {final_status} ({total_count} checks)")
+            return {
+                "status": final_status,
+                "total_count": total_count,
+                "failures": failures,
+                "sha": head_sha
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch CI status for PR #{pr_number}: {e}")
+            return {"status": "unknown", "total_count": 0, "failures": [], "sha": None}
+
+    def get_check_run_logs(self, owner: str, repo: str, check_run_id: int) -> Optional[str]:
+        """Fetch logs for a specific check run (if available)."""
+        url = f"{self.base_url}/repos/{owner}/{repo}/check-runs/{check_run_id}"
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                resp = client.get(url, headers=self.headers)
+                resp.raise_for_status()
+                data = resp.json()
+                output = data.get("output", {})
+                return output.get("text") or output.get("summary") or "No logs available"
+        except Exception as e:
+            logger.error(f"Failed to fetch check run logs: {e}")
+            return None
+
+    def create_issue(self, owner: str, repo: str, title: str, body: str) -> Dict[str, Any]:
+        """
+        Create a new issue on GitHub.
+        Returns a dict with 'success', 'issue_number', and 'url' on success,
+        or 'success': False and 'error' on failure.
+        """
+        url = f"{self.base_url}/repos/{owner}/{repo}/issues"
+        payload = {
+            "title": title,
+            "body": body
+        }
+        
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                resp = client.post(url, headers=self.headers, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+                logger.info(f"Created issue #{data.get('number')}: {title[:50]}...")
+                return {
+                    "success": True,
+                    "issue_number": data.get("number"),
+                    "url": data.get("html_url")
+                }
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 403:
+                return {
+                    "success": False,
+                    "error": "Permission Denied. Your GitHub Token needs 'repo' scope to create issues."
+                }
+            elif e.response.status_code == 404:
+                return {
+                    "success": False,
+                    "error": f"Repository '{owner}/{repo}' not found."
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": f"GitHub API error: {e.response.status_code}"
+                }
+        except Exception as e:
+            logger.error(f"Failed to create issue: {e}")
+            return {
+                "success": False,
+                "error": f"Connection error: {str(e)}"
+            }
+
     def fetch_open_issues(self, owner: str, repo: str) -> List[Dict[str, Any]]:
         """Fetch all open issues for a repo (handles pagination)."""
         url = f"{self.base_url}/repos/{owner}/{repo}/issues"

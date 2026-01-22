@@ -3,12 +3,46 @@ import json
 import time
 import re
 import logging
-from typing import Optional, Dict, Any
-from .config import AppConfig
+from pathlib import Path
+from typing import Optional, Dict, Any, List
+from .config import AppConfig, CONFIG_DIR
 
 # --- LOGGING SETUP ---
 logger = logging.getLogger("devin_client")
 logging.basicConfig(level=logging.INFO)
+
+# --- GOVERNANCE RULES FILE ---
+RULES_FILE = CONFIG_DIR / "sheriff_rules.md"
+
+DEFAULT_RULES = """# Sheriff's Code - Governance Rules
+
+These rules are automatically injected into all Devin prompts.
+
+1. Code must be Pythonic and PEP-8 compliant.
+2. No hardcoded secrets or credentials.
+3. All functions must have docstrings.
+4. Error handling must be explicit (no bare except).
+5. Tests should be updated when modifying core logic.
+"""
+
+def load_governance_rules() -> str:
+    """Load governance rules from file, creating default if missing."""
+    if not RULES_FILE.exists():
+        RULES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        RULES_FILE.write_text(DEFAULT_RULES)
+        logger.info(f"Created default governance rules at {RULES_FILE}")
+    return RULES_FILE.read_text()
+
+def save_governance_rules(content: str) -> bool:
+    """Save governance rules to file."""
+    try:
+        RULES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        RULES_FILE.write_text(content)
+        logger.info(f"Saved governance rules to {RULES_FILE}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save governance rules: {e}")
+        return False
 
 class DevinClient:
     def __init__(self, config: AppConfig):
@@ -18,6 +52,7 @@ class DevinClient:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
+        self.governance_rules = load_governance_rules()
 
     def verify_auth(self) -> bool:
         """Checks if the API key works by listing sessions (limit 1)."""
@@ -67,42 +102,64 @@ class DevinClient:
         """
         # 1. Try structured output if available (Future-proofing)
         if "structured_output" in session_data and session_data["structured_output"]:
+            logger.info("Found structured_output in session data")
             return session_data["structured_output"]
 
         # 2. Parse last assistant message
         session_id = session_data.get("session_id")
         if not session_id:
-             return {"error": "Invalid session data", "raw": session_data}
+            logger.error("No session_id in session data")
+            return {"error": "Invalid session data", "raw": session_data}
 
         try:
             with httpx.Client(timeout=30.0) as client:
                 resp = client.get(f"{self.base_url}/sessions/{session_id}/events", headers=self.headers)
+                logger.info(f"Fetched events for session {session_id}, status: {resp.status_code}")
+                
                 if resp.status_code == 200:
                     events = resp.json()
+                    logger.info(f"Found {len(events)} events in session")
+                    
                     # Look for the last message from 'assistant'
                     for event in reversed(events):
                         if event.get("type") == "assistant_message":
                             content = event.get("message", {}).get("content", "")
+                            logger.info(f"Found assistant message, length: {len(content)}")
+                            
                             # Try to find JSON block
                             json_match = re.search(r"\{.*\}", content, re.DOTALL)
                             if json_match:
                                 try:
-                                    return json.loads(json_match.group(0))
-                                except json.JSONDecodeError:
+                                    result = json.loads(json_match.group(0))
+                                    logger.info(f"Successfully parsed JSON with keys: {list(result.keys())}")
+                                    return result
+                                except json.JSONDecodeError as e:
+                                    logger.warning(f"JSON decode error: {e}")
                                     continue
+                else:
+                    logger.error(f"Failed to fetch events: {resp.status_code}")
         except Exception as e:
             logger.error(f"Error fetching events: {e}")
         
         # Fallback if parsing fails
+        logger.warning("Could not extract JSON from session, returning error dict")
         return {
             "error": "Could not parse JSON", 
             "raw_debug": "Devin finished but didn't return strict JSON."
         }
 
-    def start_scope_session(self, repo_url: str, issue_number: int, title: str, body: str):
+    def start_scope_session(self, repo_url: str, issue_number: int, title: str, body: str,
+                            similar_issues_context: Optional[str] = None):
         """
         Starts a Scope session. Timeout: 5 minutes.
+        Optionally accepts similar_issues_context from The Archive feature.
         """
+        history_section = ""
+        if similar_issues_context:
+            history_section = f"\n\n## HISTORY (The Archive)\n{similar_issues_context}\n"
+        
+        governance_section = f"\n\n## STRICT GOVERNANCE RULES\n{self.governance_rules}\n"
+        
         system_prompt = (
             "You are a Senior Software Architect. Your goal is to SCOPE a GitHub issue.\n"
             f"1. Clone the repository: {repo_url}\n"
@@ -115,6 +172,8 @@ class DevinClient:
             '  "confidence": 85\n'
             "}\n"
             "Return ONLY raw JSON. No markdown formatting."
+            f"{history_section}"
+            f"{governance_section}"
         )
 
         user_message = f"Issue #{issue_number}: {title}\n\n{body}"
@@ -137,10 +196,113 @@ class DevinClient:
             logger.error(f"Scope Session Failed: {e}")
             raise e
 
-    def start_execute_session(self, repo_url: str, issue_number: int, title: str, plan_json: dict):
+    def start_rescope_session(self, repo_url: str, issue_number: int, title: str, body: str, 
+                               previous_plan: dict, refinement_notes: str):
+        """
+        Re-scope an issue with user refinement notes.
+        This passes the previous plan and user's feedback to generate a better plan.
+        """
+        governance_section = f"\n\n## STRICT GOVERNANCE RULES\n{self.governance_rules}\n"
+        
+        system_prompt = (
+            "You are a Senior Software Architect. Your goal is to RE-SCOPE a GitHub issue based on user feedback.\n"
+            f"1. Clone the repository: {repo_url}\n"
+            "2. Review the PREVIOUS PLAN that was generated:\n"
+            f"{json.dumps(previous_plan, indent=2)}\n\n"
+            "3. The user has provided the following REFINEMENT NOTES:\n"
+            f'"{refinement_notes}"\n\n'
+            "4. Generate a NEW, IMPROVED plan that incorporates the user's feedback.\n"
+            "5. Return a JSON object with this EXACT structure:\n"
+            "{\n"
+            '  "summary": "Brief summary of the problem",\n'
+            '  "files_to_change": ["list", "of", "files"],\n'
+            '  "action_plan": ["step 1", "step 2", "step 3"],\n'
+            '  "confidence": 85,\n'
+            '  "refinement_applied": "Brief note on how user feedback was incorporated"\n'
+            "}\n"
+            "Return ONLY raw JSON. No markdown formatting."
+            f"{governance_section}"
+        )
+
+        user_message = f"Issue #{issue_number}: {title}\n\n{body}"
+
+        payload = {
+            "prompt": f"{system_prompt}\n\nOriginal Issue: {user_message}",
+            "idempotent": True 
+        }
+
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                resp = client.post(f"{self.base_url}/sessions", json=payload, headers=self.headers)
+                resp.raise_for_status()
+                session_id = resp.json()["session_id"]
+                logger.info(f"🔄 Started Re-Scope Session: {session_id}")
+                
+                final_data = self._wait_for_session(session_id, timeout_seconds=300)
+                return self._extract_last_json(final_data)
+        except Exception as e:
+            logger.error(f"Re-Scope Session Failed: {e}")
+            raise e
+
+    def start_tribunal_session(self, plan_json: dict) -> Dict[str, Any]:
+        """
+        The Tribunal: A specialized AI step to grade the plan before execution.
+        Returns a grade (A-F) and critique on Safety, Efficiency, and Completeness.
+        Uses a shorter timeout (2 minutes) since this is a quick review task.
+        """
+        system_prompt = (
+            "You are a Senior Code Reviewer on 'The Tribunal'. Your job is to GRADE an action plan.\n"
+            "Analyze the following JSON plan and evaluate it on three criteria:\n"
+            "1. SAFETY: Does it avoid touching sensitive files? Are there risks?\n"
+            "2. EFFICIENCY: Is the plan concise? Are there unnecessary steps?\n"
+            "3. COMPLETENESS: Does it address the full scope of the issue?\n\n"
+            "Return a JSON object with this EXACT structure:\n"
+            "{\n"
+            '  "grade": "B",\n'
+            '  "safety_score": 8,\n'
+            '  "efficiency_score": 7,\n'
+            '  "completeness_score": 9,\n'
+            '  "critique": "Brief explanation of the grade and any concerns",\n'
+            '  "recommendations": ["suggestion 1", "suggestion 2"]\n'
+            "}\n"
+            "Grade scale: A (excellent), B (good), C (acceptable), D (risky), F (dangerous).\n"
+            "Return ONLY raw JSON. No markdown formatting."
+        )
+        
+        payload = {
+            "prompt": f"{system_prompt}\n\nPLAN TO REVIEW:\n{json.dumps(plan_json, indent=2)}",
+            "idempotent": True
+        }
+        
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                resp = client.post(f"{self.base_url}/sessions", json=payload, headers=self.headers)
+                resp.raise_for_status()
+                session_id = resp.json()["session_id"]
+                logger.info(f"⚖️ Started Tribunal Session: {session_id}")
+                
+                final_data = self._wait_for_session(session_id, timeout_seconds=120)
+                return self._extract_last_json(final_data)
+        except Exception as e:
+            logger.error(f"Tribunal Session Failed: {e}")
+            return {"error": str(e), "grade": "?"}
+
+    def start_execute_session(self, repo_url: str, issue_number: int, title: str, plan_json: dict,
+                              ci_failure_context: Optional[str] = None):
         """
         Starts an Execution session. Timeout: 10 minutes.
+        Optionally accepts ci_failure_context for Auto-Healer retries.
         """
+        governance_section = f"\n\n## STRICT GOVERNANCE RULES\n{self.governance_rules}\n"
+        
+        ci_context = ""
+        if ci_failure_context:
+            ci_context = (
+                "\n\n## CI FAILURE CONTEXT (Auto-Healer)\n"
+                "The previous fix failed CI tests. Please analyze and fix the following errors:\n"
+                f"{ci_failure_context}\n"
+            )
+        
         system_prompt = (
             "You are a Senior DevOps Engineer. Your goal is to FIX a GitHub issue.\n"
             f"1. Clone the repository: {repo_url}\n"
@@ -149,6 +311,8 @@ class DevinClient:
             "4. Commit changes and push the branch.\n"
             f"5. Open a Pull Request. **IMPORTANT:** The PR description MUST include 'Closes #{issue_number}'.\n"
             "6. Return JSON: { \"pr_url\": \"...\", \"summary\": \"...\" }"
+            f"{ci_context}"
+            f"{governance_section}"
         )
 
         payload = {

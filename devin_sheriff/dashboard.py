@@ -7,7 +7,8 @@ import time
 import logging
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
+from difflib import SequenceMatcher
 import pandas as pd
 import streamlit as st
 
@@ -18,10 +19,11 @@ sys.path.append(str(root_dir))
 # ------------------------
 
 from devin_sheriff.models import SessionLocal, Repo, Issue, reset_database, get_db_path, init_db
-from devin_sheriff.devin_client import DevinClient
-from devin_sheriff.config import load_config, CONFIG_DIR
+from devin_sheriff.devin_client import DevinClient, load_governance_rules, save_governance_rules, RULES_FILE
+from devin_sheriff.config import load_config, save_config, CONFIG_DIR
 from devin_sheriff.sync import sync_repo_issues, sync_pr_statuses
 from devin_sheriff.github_client import GitHubClient
+from devin_sheriff.utils import test_webhook, notify_scope_complete, notify_pr_opened
 
 # --- LOGGING SETUP ---
 LOG_FILE = CONFIG_DIR / "sheriff.log"
@@ -143,8 +145,9 @@ class AsyncTaskRunner:
         self.progress = 0
         self.task_type = None
     
-    def run_scope(self, repo_url: str, issue_number: int, title: str, body: str):
-        """Run scoping in background."""
+    def run_scope(self, repo_url: str, issue_number: int, title: str, body: str, 
+                  repo_id: int = None):
+        """Run scoping in background with Archive context."""
         self.status = "running"
         self.progress = 0
         self.error = None
@@ -156,8 +159,19 @@ class AsyncTaskRunner:
                 cfg = load_config()
                 client = DevinClient(cfg)
                 
+                self.progress = 20
+                similar_context = None
+                if repo_id:
+                    similar_issues = find_similar_closed_issues(title, repo_id)
+                    if similar_issues:
+                        similar_context = build_archive_context(similar_issues)
+                        logger.info(f"Archive: Found {len(similar_issues)} similar closed issues")
+                
                 self.progress = 30
-                plan = client.start_scope_session(repo_url, issue_number, title, body)
+                plan = client.start_scope_session(
+                    repo_url, issue_number, title, body,
+                    similar_issues_context=similar_context
+                )
                 
                 self.progress = 100
                 self.result = plan
@@ -169,8 +183,9 @@ class AsyncTaskRunner:
         self.thread = threading.Thread(target=task, daemon=True)
         self.thread.start()
     
-    def run_execute(self, repo_url: str, issue_number: int, title: str, plan_json: dict):
-        """Run execution in background."""
+    def run_execute(self, repo_url: str, issue_number: int, title: str, plan_json: dict,
+                    ci_failure_context: Optional[str] = None):
+        """Run execution in background. Optionally accepts ci_failure_context for Auto-Healer."""
         self.status = "running"
         self.progress = 0
         self.error = None
@@ -183,7 +198,10 @@ class AsyncTaskRunner:
                 client = DevinClient(cfg)
                 
                 self.progress = 30
-                result = client.start_execute_session(repo_url, issue_number, title, plan_json)
+                result = client.start_execute_session(
+                    repo_url, issue_number, title, plan_json,
+                    ci_failure_context=ci_failure_context
+                )
                 
                 self.progress = 100
                 self.result = result
@@ -205,6 +223,54 @@ class AsyncTaskRunner:
 if 'task_runner' not in st.session_state:
     st.session_state.task_runner = AsyncTaskRunner()
 
+# --- RISK ANALYSIS HELPER ---
+def analyze_risk_level(files_to_change: list) -> tuple:
+    """
+    Analyze the risk level based on files being changed.
+    Returns (risk_level, risk_color, risk_description)
+    """
+    if not files_to_change:
+        return ("UNKNOWN", "gray", "No files specified in plan")
+    
+    high_risk_patterns = [
+        'config.py', '.env', 'secrets', 'credentials', 'auth', 
+        'password', 'token', 'key', 'private', 'secret',
+        'settings.py', 'config.json', 'config.yaml', 'config.yml',
+        '.pem', '.key', 'oauth', 'jwt'
+    ]
+    
+    medium_risk_patterns = [
+        'main.py', 'models.py', 'app.py', 'database', 'db.py',
+        'core/', 'src/main', 'index.py', 'server.py', 'api.py',
+        'routes.py', 'views.py', 'schema', 'migration'
+    ]
+    
+    low_risk_patterns = [
+        'readme', 'test', '.txt', '.md', 'docs/', 'doc/',
+        'example', 'sample', '.rst', 'changelog', 'license',
+        'contributing', '.gitignore', 'requirements.txt'
+    ]
+    
+    files_lower = [f.lower() for f in files_to_change]
+    
+    for file in files_lower:
+        for pattern in high_risk_patterns:
+            if pattern in file:
+                return ("HIGH", "red", f"Touches sensitive file: {file}")
+    
+    for file in files_lower:
+        for pattern in medium_risk_patterns:
+            if pattern in file:
+                return ("MEDIUM", "orange", f"Modifies core logic: {file}")
+    
+    for file in files_lower:
+        for pattern in low_risk_patterns:
+            if pattern in file:
+                return ("LOW", "green", "Only touches docs/tests")
+    
+    return ("MEDIUM", "orange", "Standard code changes")
+
+
 # --- LOG VIEWER HELPER ---
 def read_log_file(num_lines: int = 50) -> str:
     """Read the last N lines from the log file."""
@@ -217,6 +283,202 @@ def read_log_file(num_lines: int = 50) -> str:
             return ''.join(lines[-num_lines:])
     except Exception as e:
         return f"Error reading log file: {e}"
+
+
+# --- THE ARCHIVE: SIMILAR ISSUES HELPER ---
+def find_similar_closed_issues(current_title: str, repo_id: int, top_n: int = 2) -> List[Dict[str, Any]]:
+    """
+    Find similar closed issues from The Archive.
+    Uses simple keyword matching with SequenceMatcher for similarity.
+    Returns top N matches with their details.
+    """
+    db = get_db()
+    try:
+        closed_issues = db.query(Issue).filter(
+            Issue.repo_id == repo_id,
+            Issue.state == "closed",
+            Issue.status == "DONE"
+        ).all()
+        
+        if not closed_issues:
+            return []
+        
+        similarities = []
+        for issue in closed_issues:
+            ratio = SequenceMatcher(None, current_title.lower(), issue.title.lower()).ratio()
+            if ratio > 0.3:
+                files_changed = []
+                if issue.scope_json and "files_to_change" in issue.scope_json:
+                    files_changed = issue.scope_json.get("files_to_change", [])
+                
+                similarities.append({
+                    "number": issue.number,
+                    "title": issue.title,
+                    "similarity": ratio,
+                    "files_changed": files_changed,
+                    "summary": issue.scope_json.get("summary", "") if issue.scope_json else ""
+                })
+        
+        similarities.sort(key=lambda x: x["similarity"], reverse=True)
+        return similarities[:top_n]
+    finally:
+        db.close()
+
+
+def build_archive_context(similar_issues: List[Dict[str, Any]]) -> str:
+    """Build context string from similar issues for Devin prompt injection."""
+    if not similar_issues:
+        return ""
+    
+    context_parts = ["We have solved similar issues before:"]
+    for issue in similar_issues:
+        files_str = ", ".join(issue["files_changed"][:5]) if issue["files_changed"] else "N/A"
+        context_parts.append(
+            f"\nIssue #{issue['number']}: {issue['title']}\n"
+            f"  Summary: {issue['summary'][:200]}...\n"
+            f"  Files Changed: {files_str}\n"
+            f"  Use this approach if applicable."
+        )
+    return "\n".join(context_parts)
+
+
+# --- AUTO-HEALER: CI STATUS HELPERS ---
+def check_and_update_ci_status(issue: Issue, repo: Repo, db) -> Dict[str, Any]:
+    """
+    Check CI status for an issue with PR_OPEN status.
+    Updates the issue's ci_status field and returns status info.
+    """
+    if issue.status != "PR_OPEN" or not issue.pr_url:
+        return {"status": "not_applicable"}
+    
+    try:
+        import re
+        pr_match = re.search(r"/pull/(\d+)", issue.pr_url)
+        if not pr_match:
+            return {"status": "unknown", "error": "Could not parse PR number"}
+        
+        pr_number = int(pr_match.group(1))
+        
+        cfg = load_config()
+        gh = GitHubClient(cfg)
+        ci_result = gh.get_pr_ci_status(repo.owner, repo.name, pr_number)
+        
+        issue.ci_status = ci_result["status"]
+        db.commit()
+        
+        return ci_result
+    except Exception as e:
+        logger.error(f"Failed to check CI status: {e}")
+        return {"status": "unknown", "error": str(e)}
+
+
+def trigger_auto_heal(issue: Issue, repo: Repo, ci_failures: List[Dict], db):
+    """
+    Trigger Auto-Healer: Start a new execute session to fix CI failures.
+    Truncates failure descriptions to avoid token limits.
+    """
+    if issue.retry_count >= 3:
+        logger.warning(f"Issue #{issue.number} has reached max retries (3)")
+        return {"error": "Max retries reached"}
+    
+    failure_context = "CI Check Failures:\n"
+    for f in ci_failures[:5]:
+        name = f.get('name', 'Unknown')[:100]
+        desc = f.get('description', 'Check failed')[:200]
+        failure_context += f"- {name}: {desc}\n"
+    
+    if len(failure_context) > 1500:
+        failure_context = failure_context[:1500] + "\n... (truncated for token safety)"
+    
+    issue.retry_count = (issue.retry_count or 0) + 1
+    db.commit()
+    
+    logger.info(f"Auto-Healer triggered for Issue #{issue.number} (Retry {issue.retry_count}/3)")
+    
+    return {
+        "triggered": True,
+        "retry_count": issue.retry_count,
+        "failure_context": failure_context
+    }
+
+
+def get_ci_badge(ci_status: str, retry_count: int = 0) -> str:
+    """Return CI status badge HTML."""
+    if ci_status == "passing":
+        return "🟢 Passing"
+    elif ci_status == "failing":
+        if retry_count >= 3:
+            return "⚫ Failed (Max Retries)"
+        return f"🔴 Failing (Retry {retry_count}/3)"
+    elif ci_status == "pending":
+        return "🟡 Pending"
+    else:
+        return "⚪ Unknown"
+
+
+# --- THE WANTED LIST: TECH DEBT SCANNER ---
+def scan_for_todos(repo_path: str) -> List[Dict[str, Any]]:
+    """
+    Scan a local repository for TODO and FIXME comments.
+    Returns a list of dicts with file, line, and comment info.
+    """
+    todos = []
+    patterns = [
+        r'#\s*(TODO|FIXME|XXX|HACK|BUG)[\s:]+(.+)',
+        r'//\s*(TODO|FIXME|XXX|HACK|BUG)[\s:]+(.+)',
+        r'/\*\s*(TODO|FIXME|XXX|HACK|BUG)[\s:]+(.+)',
+    ]
+    
+    skip_dirs = {'.git', 'node_modules', '__pycache__', 'venv', '.venv', 'dist', 'build'}
+    skip_extensions = {'.pyc', '.pyo', '.so', '.dll', '.exe', '.bin', '.jpg', '.png', '.gif'}
+    
+    repo_path = Path(repo_path)
+    if not repo_path.exists():
+        return []
+    
+    for file_path in repo_path.rglob('*'):
+        if file_path.is_dir():
+            continue
+        
+        if any(skip_dir in file_path.parts for skip_dir in skip_dirs):
+            continue
+        
+        if file_path.suffix.lower() in skip_extensions:
+            continue
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                for line_num, line in enumerate(f, 1):
+                    for pattern in patterns:
+                        match = re.search(pattern, line, re.IGNORECASE)
+                        if match:
+                            tag = match.group(1).upper()
+                            comment = match.group(2).strip()[:100]
+                            todos.append({
+                                "file": str(file_path.relative_to(repo_path)),
+                                "line": line_num,
+                                "tag": tag,
+                                "comment": comment,
+                                "full_path": str(file_path)
+                            })
+                            break
+        except Exception:
+            continue
+    
+    return todos
+
+
+def get_tribunal_grade_color(grade: str) -> str:
+    """Return color for tribunal grade."""
+    grade_colors = {
+        "A": "green",
+        "B": "blue",
+        "C": "orange",
+        "D": "red",
+        "F": "red"
+    }
+    return grade_colors.get(grade.upper(), "gray")
+
 
 # --- MAIN DASHBOARD LOGIC ---
 def main():
@@ -235,6 +497,22 @@ def main():
     repo_names = [r.name for r in repos]
     selected_repo_name = st.sidebar.selectbox("Select Repository", repo_names)
     selected_repo = next(r for r in repos if r.name == selected_repo_name)
+
+    # AUTO-SYNC: Automatically sync on first load for each repo
+    auto_sync_key = f"auto_synced_{selected_repo.id}"
+    if auto_sync_key not in st.session_state:
+        st.session_state[auto_sync_key] = False
+    
+    if not st.session_state[auto_sync_key]:
+        with st.spinner(f"Auto-syncing {selected_repo.name}..."):
+            try:
+                sync_repo_issues(selected_repo.url)
+                sync_pr_statuses(selected_repo.url)
+                invalidate_cache()
+                st.session_state[auto_sync_key] = True
+            except Exception as e:
+                st.sidebar.warning(f"Auto-sync failed: {e}")
+                st.session_state[auto_sync_key] = True
 
     # 2. SIDEBAR: GLOBAL REFRESH BUTTONS (Always Visible)
     st.sidebar.markdown("---")
@@ -287,13 +565,13 @@ def main():
     render_danger_zone()
     
     # 3. MAIN CONTENT AREA WITH TABS
-    tab_main, tab_logs = st.tabs(["🛠 Issue Management", "📜 Live Logs"])
+    tab_main, tab_laws = st.tabs(["🛠 Issue Management", "👮‍♂️ Laws"])
     
     with tab_main:
         render_main_dashboard(selected_repo, filter_status)
     
-    with tab_logs:
-        render_log_viewer()
+    with tab_laws:
+        render_laws_tab()
 
 
 def render_main_dashboard(selected_repo, filter_status):
@@ -363,6 +641,32 @@ def render_settings_security():
         st.code(f"Logs: {LOG_FILE}", language=None)
         
         st.markdown("---")
+        st.markdown("**The Telegraph (Webhooks)**")
+        st.caption("Configure a webhook URL to receive notifications (Slack/Discord).")
+        
+        config = load_config()
+        current_webhook = config.webhook_url or ""
+        
+        new_webhook = st.text_input("Webhook URL", value=current_webhook, placeholder="https://hooks.slack.com/...")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("💾 Save Webhook", use_container_width=True):
+                config.webhook_url = new_webhook if new_webhook else None
+                save_config(config)
+                st.success("Webhook saved!")
+                time.sleep(1)
+                st.rerun()
+        
+        with col2:
+            if st.button("🔔 Test Notification", use_container_width=True):
+                result = test_webhook()
+                if result["success"]:
+                    st.success(result["message"])
+                else:
+                    st.error(result["message"])
+        
+        st.markdown("---")
         st.markdown("**Security Note**")
         st.caption("Your API keys (GitHub PAT and Devin API Key) are stored locally in the config file above. They are never sent to any third-party servers except GitHub and Devin APIs.")
         
@@ -418,6 +722,57 @@ def render_log_viewer():
     log_content = read_log_file(50)
     st.code(log_content, language="log")
 
+
+def render_laws_tab():
+    """Render the Sheriff's Code (Governance Rules) tab."""
+    st.subheader("👮‍♂️ Sheriff's Code - Governance Rules")
+    st.caption("These rules are automatically injected into all Devin prompts (Scope & Execute).")
+    
+    st.info(f"Rules file location: `{RULES_FILE}`")
+    
+    current_rules = load_governance_rules()
+    
+    edited_rules = st.text_area(
+        "Edit Governance Rules",
+        value=current_rules,
+        height=400,
+        help="These rules will be appended to every Devin prompt to enforce code standards."
+    )
+    
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        if st.button("💾 Save Rules", type="primary", use_container_width=True):
+            if save_governance_rules(edited_rules):
+                st.success("Rules saved successfully!")
+                time.sleep(1)
+                st.rerun()
+            else:
+                st.error("Failed to save rules. Check logs for details.")
+    
+    with col2:
+        if st.button("🔄 Reset to Default", use_container_width=True):
+            from devin_sheriff.devin_client import DEFAULT_RULES
+            if save_governance_rules(DEFAULT_RULES):
+                st.success("Rules reset to default!")
+                time.sleep(1)
+                st.rerun()
+            else:
+                st.error("Failed to reset rules.")
+    
+    st.markdown("---")
+    st.markdown("### How It Works")
+    st.markdown("""
+    1. When you trigger **Scope** or **Execute**, these rules are appended to the system prompt.
+    2. Devin will follow these rules when generating code.
+    3. Use this to enforce team standards, security policies, or coding conventions.
+    
+    **Example Rules:**
+    - "All API endpoints must have rate limiting"
+    - "Database queries must use parameterized statements"
+    - "No console.log statements in production code"
+    """)
+
+
 # --- WORKSPACE RENDERER ---
 def render_issue_workspace(issue, repo, db):
     """Renders the detailed view and action buttons for a single issue."""
@@ -430,11 +785,30 @@ def render_issue_workspace(issue, repo, db):
             st.markdown(issue.body if issue.body else "*No description provided.*")
 
         if issue.scope_json:
-            st.success(f"**Plan Ready** (Confidence: {issue.confidence}%)")
+            # Check if scope_json contains an error (failed to parse Devin response)
+            if "error" in issue.scope_json:
+                st.error(f"**Scoping Failed:** {issue.scope_json.get('error', 'Unknown error')}")
+                st.caption("Try re-scoping this issue or check the Live Logs for details.")
+            else:
+                st.success(f"**Plan Ready** (Confidence: {issue.confidence}%)")
+            
+            # FEATURE 2: Risk Level Badge (Suspect Profiling)
+            files_to_change = issue.scope_json.get("files_to_change", [])
+            risk_level, risk_color, risk_desc = analyze_risk_level(files_to_change)
+            
+            risk_emoji = {"HIGH": "🔴", "MEDIUM": "🟠", "LOW": "🟢", "UNKNOWN": "⚪"}.get(risk_level, "⚪")
+            st.markdown(f"**Risk Level:** {risk_emoji} :{risk_color}[{risk_level}]")
+            st.caption(risk_desc)
             
             # Plan Editor Feature for SCOPED issues
             if issue.status == "SCOPED":
                 render_plan_editor(issue, db)
+                
+                # FEATURE: The Tribunal (Plan Review)
+                render_tribunal_section(issue, repo)
+                
+                # FEATURE 3: The Interrogation Room (Refine Plan)
+                render_interrogation_room(issue, repo, db)
             else:
                 with st.expander("📋 View Action Plan", expanded=True):
                     render_plan_display(issue.scope_json)
@@ -454,29 +828,71 @@ def render_issue_workspace(issue, repo, db):
 
         if issue.status == "PR_OPEN" and issue.pr_url:
             st.success(f"🚀 [View Pull Request]({issue.pr_url})")
+            
+            ci_badge = get_ci_badge(issue.ci_status or "unknown", issue.retry_count or 0)
+            st.markdown(f"**CI Status:** {ci_badge}")
+            
+            if st.button("🔄 Check CI Status", key=f"check_ci_{issue.id}", use_container_width=True):
+                with st.spinner("Checking CI status..."):
+                    ci_result = check_and_update_ci_status(issue, repo, db)
+                    if ci_result["status"] == "failing":
+                        st.warning(f"CI is failing! {len(ci_result.get('failures', []))} check(s) failed.")
+                        
+                        if (issue.retry_count or 0) < 3:
+                            st.markdown("**Auto-Healer Available**")
+                            if st.button("🔧 Auto-Heal (Retry Fix)", key=f"auto_heal_{issue.id}", type="primary"):
+                                heal_result = trigger_auto_heal(issue, repo, ci_result.get("failures", []), db)
+                                if "error" not in heal_result:
+                                    st.toast(f"🩹 Auto-Healing triggered for Issue #{issue.number}")
+                                    
+                                    st.info("Waiting 5 seconds before calling Devin (rate limiting)...")
+                                    time.sleep(5)
+                                    
+                                    task_runner = st.session_state.task_runner
+                                    plan_to_use = issue.scope_json or {}
+                                    task_runner.run_execute(
+                                        repo.url, issue.number, issue.title, plan_to_use,
+                                        ci_failure_context=heal_result.get("failure_context")
+                                    )
+                                    st.info(f"Auto-Healer triggered (Retry {heal_result['retry_count']}/3)")
+                                    time.sleep(1)
+                                    st.rerun()
+                                else:
+                                    st.error(heal_result["error"])
+                        else:
+                            st.error("Max retries (3) reached. Manual intervention required.")
+                    elif ci_result["status"] == "passing":
+                        st.success("All CI checks passed!")
+                    elif ci_result["status"] == "pending":
+                        st.info("CI checks still running...")
+                    st.rerun()
         
         st.markdown("---")
 
         # Check if async task is running
         task_runner = st.session_state.task_runner
         
+        # Auto-check for task completion
+        if task_runner.status == "completed":
+            handle_task_completion(issue, task_runner, db)
+            st.rerun()
+        elif task_runner.status == "failed":
+            st.error(f"Task failed: {task_runner.error}")
+            task_runner.status = "idle"
+        
         if task_runner.is_running():
             st.info("🔄 Task in progress...")
             progress = task_runner.get_progress()
             st.progress(progress / 100)
             
-            if st.button("Check Status"):
-                if task_runner.status == "completed":
-                    handle_task_completion(issue, task_runner, db)
-                elif task_runner.status == "failed":
-                    st.error(f"Task failed: {task_runner.error}")
-                    task_runner.status = "idle"
-                st.rerun()
+            # Auto-refresh every 2 seconds while task is running
+            time.sleep(2)
+            st.rerun()
         else:
             # BUTTON: SCOPE (Planning)
             if issue.status in ["NEW", "DONE"]:
                 if st.button("🔍 Start Scoping", key=f"scope_{issue.id}", type="primary", use_container_width=True):
-                    task_runner.run_scope(repo.url, issue.number, issue.title, issue.body)
+                    task_runner.run_scope(repo.url, issue.number, issue.title, issue.body, repo_id=repo.id)
                     st.info("Scoping started in background...")
                     time.sleep(1)
                     st.rerun()
@@ -607,6 +1023,56 @@ def render_plan_editor(issue, db):
             st.warning("Using edited plan (not saved to database)")
 
 
+def render_interrogation_room(issue, repo, db):
+    """
+    Feature 3: The Interrogation Room - Refine plans with natural language feedback.
+    Allows users to provide instructions to improve the generated plan.
+    """
+    with st.expander("👮 Interrogation Room (Refine Plan)", expanded=False):
+        st.info("💡 **Refine the plan:** Provide instructions to improve Devin's approach. "
+                "Example: 'Don't touch main.py, create a helper file instead.'")
+        
+        refinement_notes = st.text_area(
+            "Your refinement instructions:",
+            placeholder="e.g., 'Focus only on the API layer, don't modify the database models.'",
+            height=100,
+            key=f"interrogate_{issue.id}"
+        )
+        
+        if st.button("🔄 Re-Scope with Feedback", key=f"refine_{issue.id}", type="primary", use_container_width=True):
+            if not refinement_notes.strip():
+                st.warning("Please provide refinement instructions first.")
+            else:
+                with st.spinner("👮 Interrogating Devin with your feedback... (1-3 minutes)"):
+                    try:
+                        cfg = load_config()
+                        client = DevinClient(cfg)
+                        
+                        new_plan = client.start_rescope_session(
+                            repo.url,
+                            issue.number,
+                            issue.title,
+                            issue.body or "",
+                            issue.scope_json,
+                            refinement_notes
+                        )
+                        
+                        issue.scope_json = new_plan
+                        issue.confidence = new_plan.get("confidence", 0)
+                        db.commit()
+                        invalidate_cache()
+                        
+                        st.success("Plan refined successfully!")
+                        if new_plan.get("refinement_applied"):
+                            st.info(f"📝 {new_plan['refinement_applied']}")
+                        time.sleep(1)
+                        st.rerun()
+                        
+                    except Exception as e:
+                        st.error(f"Re-scope failed: {str(e)}")
+                        logger.error(f"Interrogation failed for issue #{issue.number}: {e}")
+
+
 def handle_task_completion(issue, task_runner, db):
     """Handle completion of async scope/execute tasks."""
     if task_runner.result:
@@ -731,6 +1197,147 @@ def run_execute_action(repo, issue, db):
 
     except Exception as e:
         st.error(f"Execution Failed: {str(e)}")
+
+
+def render_wanted_tab(selected_repo):
+    """Render the Wanted List (Tech Debt Scanner) tab."""
+    st.subheader("📜 The Wanted List - Tech Debt Scanner")
+    st.caption("Scan your local repository for TODO, FIXME, and other tech debt markers.")
+    
+    st.markdown("---")
+    st.markdown("**Enter Local Repository Path**")
+    st.caption("This should be the path to a local clone of your repository.")
+    
+    default_path = f"/home/ubuntu/repos/{selected_repo.name}"
+    repo_path = st.text_input("Local Repo Path", value=default_path, key="wanted_repo_path")
+    
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        scan_button = st.button("🔍 Scan for TODOs", type="primary", use_container_width=True)
+    
+    if scan_button:
+        with st.spinner("Scanning repository for tech debt..."):
+            todos = scan_for_todos(repo_path)
+            st.session_state.wanted_todos = todos
+            st.session_state.wanted_scanned_path = repo_path
+    
+    if 'wanted_todos' in st.session_state and st.session_state.wanted_todos:
+        todos = st.session_state.wanted_todos
+        
+        st.success(f"Found {len(todos)} tech debt items!")
+        
+        tag_counts = {}
+        for t in todos:
+            tag_counts[t['tag']] = tag_counts.get(t['tag'], 0) + 1
+        
+        cols = st.columns(len(tag_counts))
+        for i, (tag, count) in enumerate(tag_counts.items()):
+            cols[i].metric(tag, count)
+        
+        st.markdown("---")
+        
+        for idx, todo in enumerate(todos[:50]):
+            with st.container():
+                col1, col2, col3 = st.columns([3, 1, 1])
+                
+                with col1:
+                    tag_color = {"TODO": "blue", "FIXME": "red", "XXX": "orange", "HACK": "orange", "BUG": "red"}.get(todo['tag'], "gray")
+                    st.markdown(f"**:{tag_color}[{todo['tag']}]** `{todo['file']}:{todo['line']}`")
+                    st.caption(todo['comment'])
+                
+                with col2:
+                    st.caption(f"Line {todo['line']}")
+                
+                with col3:
+                    if st.button("⭐ Create Issue", key=f"create_issue_{idx}", use_container_width=True):
+                        title = f"Refactor: {todo['comment'][:50]}..."
+                        body = (
+                            f"**Tech Debt Found by Sheriff**\n\n"
+                            f"**Type:** {todo['tag']}\n"
+                            f"**File:** `{todo['file']}`\n"
+                            f"**Line:** {todo['line']}\n\n"
+                            f"**Comment:**\n```\n{todo['comment']}\n```\n\n"
+                            f"---\n*Created by Devin Sheriff's Wanted List scanner*"
+                        )
+                        
+                        try:
+                            cfg = load_config()
+                            gh = GitHubClient(cfg)
+                            result = gh.create_issue(selected_repo.owner, selected_repo.name, title, body)
+                            
+                            if result["success"]:
+                                st.toast(f"Issue #{result['issue_number']} created!", icon="⭐")
+                                sync_repo_issues(selected_repo.url)
+                                invalidate_cache()
+                                time.sleep(1)
+                                st.rerun()
+                            else:
+                                st.error(result["error"])
+                        except Exception as e:
+                            st.error(f"Failed to create issue: {e}")
+                
+                st.markdown("---")
+        
+        if len(todos) > 50:
+            st.info(f"Showing first 50 of {len(todos)} items. Clean up some tech debt!")
+    
+    elif 'wanted_todos' in st.session_state and not st.session_state.wanted_todos:
+        st.success("No tech debt found! Your codebase is clean.")
+
+
+def render_tribunal_section(issue, repo):
+    """Render The Tribunal (Plan Review) section."""
+    st.markdown("---")
+    st.markdown("### ⚖️ The Tribunal - Plan Review")
+    st.caption("Get an AI-powered grade on your plan before execution.")
+    
+    if 'tribunal_result' not in st.session_state:
+        st.session_state.tribunal_result = None
+    
+    col1, col2 = st.columns([1, 3])
+    
+    with col1:
+        if st.button("⚖️ Convene Tribunal", type="secondary", use_container_width=True):
+            with st.spinner("The Tribunal is reviewing the plan..."):
+                try:
+                    cfg = load_config()
+                    client = DevinClient(cfg)
+                    result = client.start_tribunal_session(issue.scope_json)
+                    st.session_state.tribunal_result = result
+                except Exception as e:
+                    st.error(f"Tribunal failed: {e}")
+    
+    if st.session_state.tribunal_result:
+        result = st.session_state.tribunal_result
+        
+        if "error" in result and result.get("grade") == "?":
+            st.error(f"Tribunal error: {result.get('error')}")
+        else:
+            grade = result.get("grade", "?")
+            grade_color = get_tribunal_grade_color(grade)
+            
+            st.markdown(f"## Grade: :{grade_color}[{grade}]")
+            
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Safety", f"{result.get('safety_score', '?')}/10")
+            col2.metric("Efficiency", f"{result.get('efficiency_score', '?')}/10")
+            col3.metric("Completeness", f"{result.get('completeness_score', '?')}/10")
+            
+            if result.get("critique"):
+                st.markdown("**Critique:**")
+                st.info(result["critique"])
+            
+            if result.get("recommendations"):
+                st.markdown("**Recommendations:**")
+                for rec in result["recommendations"]:
+                    st.markdown(f"- {rec}")
+            
+            if grade in ["D", "F"]:
+                st.warning("⚠️ **Tribunal advises against execution.** Consider refining the plan first.")
+            
+            if st.button("🔄 Clear Tribunal Result"):
+                st.session_state.tribunal_result = None
+                st.rerun()
 
 
 if __name__ == "__main__":

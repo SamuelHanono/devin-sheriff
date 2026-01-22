@@ -45,6 +45,10 @@ class Issue(Base):
     pr_url = Column(String, nullable=True)
     last_error = Column(Text, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Auto-Healer fields for CI/CD feedback loop
+    retry_count = Column(Integer, default=0)
+    ci_status = Column(String, nullable=True)  # passing, failing, pending, unknown
 
     # Relationships
     repo = relationship("Repo", back_populates="issues")
@@ -77,9 +81,44 @@ def get_engine():
     DB_DIR.mkdir(parents=True, exist_ok=True)
     return create_engine(DB_FILE, connect_args={"check_same_thread": False})
 
+def migrate_db(engine):
+    """
+    Run database migrations to add new columns to existing tables.
+    This handles upgrading existing databases without requiring Factory Reset.
+    """
+    import sqlite3
+    import logging
+    
+    db_path = DB_DIR / "sheriff.db"
+    if not db_path.exists():
+        return
+    
+    conn = sqlite3.connect(str(db_path))
+    cursor = conn.cursor()
+    
+    cursor.execute("PRAGMA table_info(issues)")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+    
+    migrations = [
+        ("retry_count", "ALTER TABLE issues ADD COLUMN retry_count INTEGER DEFAULT 0"),
+        ("ci_status", "ALTER TABLE issues ADD COLUMN ci_status TEXT"),
+    ]
+    
+    for column_name, sql in migrations:
+        if column_name not in existing_columns:
+            try:
+                cursor.execute(sql)
+                logging.info(f"Migration: Added column '{column_name}' to issues table")
+            except sqlite3.OperationalError as e:
+                logging.warning(f"Migration warning for '{column_name}': {e}")
+    
+    conn.commit()
+    conn.close()
+
 def init_db():
     """Creates tables if they don't exist and returns a session factory."""
     engine = get_engine()
+    migrate_db(engine)
     Base.metadata.create_all(engine)
     return sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
