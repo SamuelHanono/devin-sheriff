@@ -1209,7 +1209,7 @@ def render_wanted_tab(selected_repo):
         with st.spinner("Scanning repository for tech debt..."):
             todos = scan_for_todos(repo_path)
             st.session_state.wanted_todos = todos
-            st.session_state.wanted_repo_path = repo_path
+            st.session_state.wanted_scanned_path = repo_path
     
     if 'wanted_todos' in st.session_state and st.session_state.wanted_todos:
         todos = st.session_state.wanted_todos
