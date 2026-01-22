@@ -45,6 +45,10 @@ class Issue(Base):
     pr_url = Column(String, nullable=True)
     last_error = Column(Text, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Auto-Healer fields for CI/CD feedback loop
+    retry_count = Column(Integer, default=0)
+    ci_status = Column(String, nullable=True)  # passing, failing, pending, unknown
 
     # Relationships
     repo = relationship("Repo", back_populates="issues")

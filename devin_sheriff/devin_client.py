@@ -3,12 +3,46 @@ import json
 import time
 import re
 import logging
-from typing import Optional, Dict, Any
-from .config import AppConfig
+from pathlib import Path
+from typing import Optional, Dict, Any, List
+from .config import AppConfig, CONFIG_DIR
 
 # --- LOGGING SETUP ---
 logger = logging.getLogger("devin_client")
 logging.basicConfig(level=logging.INFO)
+
+# --- GOVERNANCE RULES FILE ---
+RULES_FILE = CONFIG_DIR / "sheriff_rules.md"
+
+DEFAULT_RULES = """# Sheriff's Code - Governance Rules
+
+These rules are automatically injected into all Devin prompts.
+
+1. Code must be Pythonic and PEP-8 compliant.
+2. No hardcoded secrets or credentials.
+3. All functions must have docstrings.
+4. Error handling must be explicit (no bare except).
+5. Tests should be updated when modifying core logic.
+"""
+
+def load_governance_rules() -> str:
+    """Load governance rules from file, creating default if missing."""
+    if not RULES_FILE.exists():
+        RULES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        RULES_FILE.write_text(DEFAULT_RULES)
+        logger.info(f"Created default governance rules at {RULES_FILE}")
+    return RULES_FILE.read_text()
+
+def save_governance_rules(content: str) -> bool:
+    """Save governance rules to file."""
+    try:
+        RULES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        RULES_FILE.write_text(content)
+        logger.info(f"Saved governance rules to {RULES_FILE}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save governance rules: {e}")
+        return False
 
 class DevinClient:
     def __init__(self, config: AppConfig):
@@ -18,6 +52,7 @@ class DevinClient:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
+        self.governance_rules = load_governance_rules()
 
     def verify_auth(self) -> bool:
         """Checks if the API key works by listing sessions (limit 1)."""
@@ -113,10 +148,18 @@ class DevinClient:
             "raw_debug": "Devin finished but didn't return strict JSON."
         }
 
-    def start_scope_session(self, repo_url: str, issue_number: int, title: str, body: str):
+    def start_scope_session(self, repo_url: str, issue_number: int, title: str, body: str,
+                            similar_issues_context: Optional[str] = None):
         """
         Starts a Scope session. Timeout: 5 minutes.
+        Optionally accepts similar_issues_context from The Archive feature.
         """
+        history_section = ""
+        if similar_issues_context:
+            history_section = f"\n\n## HISTORY (The Archive)\n{similar_issues_context}\n"
+        
+        governance_section = f"\n\n## STRICT GOVERNANCE RULES\n{self.governance_rules}\n"
+        
         system_prompt = (
             "You are a Senior Software Architect. Your goal is to SCOPE a GitHub issue.\n"
             f"1. Clone the repository: {repo_url}\n"
@@ -129,6 +172,8 @@ class DevinClient:
             '  "confidence": 85\n'
             "}\n"
             "Return ONLY raw JSON. No markdown formatting."
+            f"{history_section}"
+            f"{governance_section}"
         )
 
         user_message = f"Issue #{issue_number}: {title}\n\n{body}"
@@ -157,6 +202,8 @@ class DevinClient:
         Re-scope an issue with user refinement notes.
         This passes the previous plan and user's feedback to generate a better plan.
         """
+        governance_section = f"\n\n## STRICT GOVERNANCE RULES\n{self.governance_rules}\n"
+        
         system_prompt = (
             "You are a Senior Software Architect. Your goal is to RE-SCOPE a GitHub issue based on user feedback.\n"
             f"1. Clone the repository: {repo_url}\n"
@@ -174,6 +221,7 @@ class DevinClient:
             '  "refinement_applied": "Brief note on how user feedback was incorporated"\n'
             "}\n"
             "Return ONLY raw JSON. No markdown formatting."
+            f"{governance_section}"
         )
 
         user_message = f"Issue #{issue_number}: {title}\n\n{body}"
@@ -196,10 +244,22 @@ class DevinClient:
             logger.error(f"Re-Scope Session Failed: {e}")
             raise e
 
-    def start_execute_session(self, repo_url: str, issue_number: int, title: str, plan_json: dict):
+    def start_execute_session(self, repo_url: str, issue_number: int, title: str, plan_json: dict,
+                              ci_failure_context: Optional[str] = None):
         """
         Starts an Execution session. Timeout: 10 minutes.
+        Optionally accepts ci_failure_context for Auto-Healer retries.
         """
+        governance_section = f"\n\n## STRICT GOVERNANCE RULES\n{self.governance_rules}\n"
+        
+        ci_context = ""
+        if ci_failure_context:
+            ci_context = (
+                "\n\n## CI FAILURE CONTEXT (Auto-Healer)\n"
+                "The previous fix failed CI tests. Please analyze and fix the following errors:\n"
+                f"{ci_failure_context}\n"
+            )
+        
         system_prompt = (
             "You are a Senior DevOps Engineer. Your goal is to FIX a GitHub issue.\n"
             f"1. Clone the repository: {repo_url}\n"
@@ -208,6 +268,8 @@ class DevinClient:
             "4. Commit changes and push the branch.\n"
             f"5. Open a Pull Request. **IMPORTANT:** The PR description MUST include 'Closes #{issue_number}'.\n"
             "6. Return JSON: { \"pr_url\": \"...\", \"summary\": \"...\" }"
+            f"{ci_context}"
+            f"{governance_section}"
         )
 
         payload = {

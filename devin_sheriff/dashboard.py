@@ -7,7 +7,8 @@ import time
 import logging
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
+from difflib import SequenceMatcher
 import pandas as pd
 import streamlit as st
 
@@ -18,7 +19,7 @@ sys.path.append(str(root_dir))
 # ------------------------
 
 from devin_sheriff.models import SessionLocal, Repo, Issue, reset_database, get_db_path, init_db
-from devin_sheriff.devin_client import DevinClient
+from devin_sheriff.devin_client import DevinClient, load_governance_rules, save_governance_rules, RULES_FILE
 from devin_sheriff.config import load_config, CONFIG_DIR
 from devin_sheriff.sync import sync_repo_issues, sync_pr_statuses
 from devin_sheriff.github_client import GitHubClient
@@ -143,8 +144,9 @@ class AsyncTaskRunner:
         self.progress = 0
         self.task_type = None
     
-    def run_scope(self, repo_url: str, issue_number: int, title: str, body: str):
-        """Run scoping in background."""
+    def run_scope(self, repo_url: str, issue_number: int, title: str, body: str, 
+                  repo_id: int = None):
+        """Run scoping in background with Archive context."""
         self.status = "running"
         self.progress = 0
         self.error = None
@@ -156,8 +158,19 @@ class AsyncTaskRunner:
                 cfg = load_config()
                 client = DevinClient(cfg)
                 
+                self.progress = 20
+                similar_context = None
+                if repo_id:
+                    similar_issues = find_similar_closed_issues(title, repo_id)
+                    if similar_issues:
+                        similar_context = build_archive_context(similar_issues)
+                        logger.info(f"Archive: Found {len(similar_issues)} similar closed issues")
+                
                 self.progress = 30
-                plan = client.start_scope_session(repo_url, issue_number, title, body)
+                plan = client.start_scope_session(
+                    repo_url, issue_number, title, body,
+                    similar_issues_context=similar_context
+                )
                 
                 self.progress = 100
                 self.result = plan
@@ -266,6 +279,131 @@ def read_log_file(num_lines: int = 50) -> str:
     except Exception as e:
         return f"Error reading log file: {e}"
 
+
+# --- THE ARCHIVE: SIMILAR ISSUES HELPER ---
+def find_similar_closed_issues(current_title: str, repo_id: int, top_n: int = 2) -> List[Dict[str, Any]]:
+    """
+    Find similar closed issues from The Archive.
+    Uses simple keyword matching with SequenceMatcher for similarity.
+    Returns top N matches with their details.
+    """
+    db = get_db()
+    try:
+        closed_issues = db.query(Issue).filter(
+            Issue.repo_id == repo_id,
+            Issue.state == "closed",
+            Issue.status == "DONE"
+        ).all()
+        
+        if not closed_issues:
+            return []
+        
+        similarities = []
+        for issue in closed_issues:
+            ratio = SequenceMatcher(None, current_title.lower(), issue.title.lower()).ratio()
+            if ratio > 0.3:
+                files_changed = []
+                if issue.scope_json and "files_to_change" in issue.scope_json:
+                    files_changed = issue.scope_json.get("files_to_change", [])
+                
+                similarities.append({
+                    "number": issue.number,
+                    "title": issue.title,
+                    "similarity": ratio,
+                    "files_changed": files_changed,
+                    "summary": issue.scope_json.get("summary", "") if issue.scope_json else ""
+                })
+        
+        similarities.sort(key=lambda x: x["similarity"], reverse=True)
+        return similarities[:top_n]
+    finally:
+        db.close()
+
+
+def build_archive_context(similar_issues: List[Dict[str, Any]]) -> str:
+    """Build context string from similar issues for Devin prompt injection."""
+    if not similar_issues:
+        return ""
+    
+    context_parts = ["We have solved similar issues before:"]
+    for issue in similar_issues:
+        files_str = ", ".join(issue["files_changed"][:5]) if issue["files_changed"] else "N/A"
+        context_parts.append(
+            f"\nIssue #{issue['number']}: {issue['title']}\n"
+            f"  Summary: {issue['summary'][:200]}...\n"
+            f"  Files Changed: {files_str}\n"
+            f"  Use this approach if applicable."
+        )
+    return "\n".join(context_parts)
+
+
+# --- AUTO-HEALER: CI STATUS HELPERS ---
+def check_and_update_ci_status(issue: Issue, repo: Repo, db) -> Dict[str, Any]:
+    """
+    Check CI status for an issue with PR_OPEN status.
+    Updates the issue's ci_status field and returns status info.
+    """
+    if issue.status != "PR_OPEN" or not issue.pr_url:
+        return {"status": "not_applicable"}
+    
+    try:
+        import re
+        pr_match = re.search(r"/pull/(\d+)", issue.pr_url)
+        if not pr_match:
+            return {"status": "unknown", "error": "Could not parse PR number"}
+        
+        pr_number = int(pr_match.group(1))
+        
+        cfg = load_config()
+        gh = GitHubClient(cfg)
+        ci_result = gh.get_pr_ci_status(repo.owner, repo.name, pr_number)
+        
+        issue.ci_status = ci_result["status"]
+        db.commit()
+        
+        return ci_result
+    except Exception as e:
+        logger.error(f"Failed to check CI status: {e}")
+        return {"status": "unknown", "error": str(e)}
+
+
+def trigger_auto_heal(issue: Issue, repo: Repo, ci_failures: List[Dict], db):
+    """
+    Trigger Auto-Healer: Start a new execute session to fix CI failures.
+    """
+    if issue.retry_count >= 3:
+        logger.warning(f"Issue #{issue.number} has reached max retries (3)")
+        return {"error": "Max retries reached"}
+    
+    failure_context = "CI Check Failures:\n"
+    for f in ci_failures[:5]:
+        failure_context += f"- {f['name']}: {f['description']}\n"
+    
+    issue.retry_count = (issue.retry_count or 0) + 1
+    db.commit()
+    
+    logger.info(f"Auto-Healer triggered for Issue #{issue.number} (Retry {issue.retry_count}/3)")
+    
+    return {
+        "triggered": True,
+        "retry_count": issue.retry_count,
+        "failure_context": failure_context
+    }
+
+
+def get_ci_badge(ci_status: str, retry_count: int = 0) -> str:
+    """Return CI status badge HTML."""
+    if ci_status == "passing":
+        return "🟢 Passing"
+    elif ci_status == "failing":
+        if retry_count >= 3:
+            return "⚫ Failed (Max Retries)"
+        return f"🔴 Failing (Retry {retry_count}/3)"
+    elif ci_status == "pending":
+        return "🟡 Pending"
+    else:
+        return "⚪ Unknown"
+
 # --- MAIN DASHBOARD LOGIC ---
 def main():
     st.title("🤠 Devin Sheriff v2.0")
@@ -335,13 +473,16 @@ def main():
     render_danger_zone()
     
     # 3. MAIN CONTENT AREA WITH TABS
-    tab_main, tab_logs = st.tabs(["🛠 Issue Management", "📜 Live Logs"])
+    tab_main, tab_logs, tab_laws = st.tabs(["🛠 Issue Management", "📜 Live Logs", "👮‍♂️ Laws"])
     
     with tab_main:
         render_main_dashboard(selected_repo, filter_status)
     
     with tab_logs:
         render_log_viewer()
+    
+    with tab_laws:
+        render_laws_tab()
 
 
 def render_main_dashboard(selected_repo, filter_status):
@@ -466,6 +607,57 @@ def render_log_viewer():
     log_content = read_log_file(50)
     st.code(log_content, language="log")
 
+
+def render_laws_tab():
+    """Render the Sheriff's Code (Governance Rules) tab."""
+    st.subheader("👮‍♂️ Sheriff's Code - Governance Rules")
+    st.caption("These rules are automatically injected into all Devin prompts (Scope & Execute).")
+    
+    st.info(f"Rules file location: `{RULES_FILE}`")
+    
+    current_rules = load_governance_rules()
+    
+    edited_rules = st.text_area(
+        "Edit Governance Rules",
+        value=current_rules,
+        height=400,
+        help="These rules will be appended to every Devin prompt to enforce code standards."
+    )
+    
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        if st.button("💾 Save Rules", type="primary", use_container_width=True):
+            if save_governance_rules(edited_rules):
+                st.success("Rules saved successfully!")
+                time.sleep(1)
+                st.rerun()
+            else:
+                st.error("Failed to save rules. Check logs for details.")
+    
+    with col2:
+        if st.button("🔄 Reset to Default", use_container_width=True):
+            from devin_sheriff.devin_client import DEFAULT_RULES
+            if save_governance_rules(DEFAULT_RULES):
+                st.success("Rules reset to default!")
+                time.sleep(1)
+                st.rerun()
+            else:
+                st.error("Failed to reset rules.")
+    
+    st.markdown("---")
+    st.markdown("### How It Works")
+    st.markdown("""
+    1. When you trigger **Scope** or **Execute**, these rules are appended to the system prompt.
+    2. Devin will follow these rules when generating code.
+    3. Use this to enforce team standards, security policies, or coding conventions.
+    
+    **Example Rules:**
+    - "All API endpoints must have rate limiting"
+    - "Database queries must use parameterized statements"
+    - "No console.log statements in production code"
+    """)
+
+
 # --- WORKSPACE RENDERER ---
 def render_issue_workspace(issue, repo, db):
     """Renders the detailed view and action buttons for a single issue."""
@@ -518,6 +710,38 @@ def render_issue_workspace(issue, repo, db):
 
         if issue.status == "PR_OPEN" and issue.pr_url:
             st.success(f"🚀 [View Pull Request]({issue.pr_url})")
+            
+            ci_badge = get_ci_badge(issue.ci_status or "unknown", issue.retry_count or 0)
+            st.markdown(f"**CI Status:** {ci_badge}")
+            
+            if st.button("🔄 Check CI Status", key=f"check_ci_{issue.id}", use_container_width=True):
+                with st.spinner("Checking CI status..."):
+                    ci_result = check_and_update_ci_status(issue, repo, db)
+                    if ci_result["status"] == "failing":
+                        st.warning(f"CI is failing! {len(ci_result.get('failures', []))} check(s) failed.")
+                        
+                        if (issue.retry_count or 0) < 3:
+                            st.markdown("**Auto-Healer Available**")
+                            if st.button("🔧 Auto-Heal (Retry Fix)", key=f"auto_heal_{issue.id}", type="primary"):
+                                heal_result = trigger_auto_heal(issue, repo, ci_result.get("failures", []), db)
+                                if "error" not in heal_result:
+                                    task_runner = st.session_state.task_runner
+                                    plan_to_use = issue.scope_json or {}
+                                    task_runner.run_execute(
+                                        repo.url, issue.number, issue.title, plan_to_use
+                                    )
+                                    st.info(f"Auto-Healer triggered (Retry {heal_result['retry_count']}/3)")
+                                    time.sleep(1)
+                                    st.rerun()
+                                else:
+                                    st.error(heal_result["error"])
+                        else:
+                            st.error("Max retries (3) reached. Manual intervention required.")
+                    elif ci_result["status"] == "passing":
+                        st.success("All CI checks passed!")
+                    elif ci_result["status"] == "pending":
+                        st.info("CI checks still running...")
+                    st.rerun()
         
         st.markdown("---")
 
@@ -544,7 +768,7 @@ def render_issue_workspace(issue, repo, db):
             # BUTTON: SCOPE (Planning)
             if issue.status in ["NEW", "DONE"]:
                 if st.button("🔍 Start Scoping", key=f"scope_{issue.id}", type="primary", use_container_width=True):
-                    task_runner.run_scope(repo.url, issue.number, issue.title, issue.body)
+                    task_runner.run_scope(repo.url, issue.number, issue.title, issue.body, repo_id=repo.id)
                     st.info("Scoping started in background...")
                     time.sleep(1)
                     st.rerun()
