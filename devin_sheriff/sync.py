@@ -1,94 +1,125 @@
+import re
+import logging
+from sqlalchemy.orm import Session
 from .models import SessionLocal, Repo, Issue
 from .github_client import GitHubClient
 from .config import load_config
-import re
 
-def sync_repo_issues(repo_url: str):
+# --- LOGGING SETUP ---
+logger = logging.getLogger("sync")
+logging.basicConfig(level=logging.INFO)
+
+def sync_repo_issues(repo_url: str) -> str:
     """
-    Full Sync:
+    Full Sync Logic:
     1. Fetches all currently OPEN issues from GitHub.
     2. Adds new issues to DB.
-    3. Updates existing issues.
+    3. Updates existing issues (title/body).
     4. Marks local issues as DONE if they are no longer in the GitHub list.
     """
     
-    # 1. Setup
+    # 1. Setup & Configuration Check
     config = load_config()
     if not config.github_token:
-        return "Error: No GitHub Token found."
+        logger.error("Sync failed: No GitHub Token found.")
+        return "Error: No GitHub Token found. Run 'setup'."
 
-    gh = GitHubClient(config)
-    
-    # Parse Owner/Repo
+    # 2. Parse URL
     match = re.search(r"github\.com/([^/]+)/([^/]+)", repo_url)
     if not match:
-        return "Error: Invalid Repo URL"
+        return "Error: Invalid Repo URL. Must be 'github.com/owner/repo'."
     
     owner, repo_name = match.groups()
     repo_name = repo_name.replace(".git", "")
 
-    # 2. Get GitHub Data
+    # 3. Fetch Data from GitHub
+    logger.info(f"Syncing {owner}/{repo_name}...")
     try:
+        gh = GitHubClient(config)
         gh_issues = gh.fetch_open_issues(owner, repo_name)
     except Exception as e:
+        logger.error(f"GitHub API Error: {e}")
         return f"GitHub API Error: {e}"
 
-    # 3. Update Database
-    db = SessionLocal()
-    repo = db.query(Repo).filter_by(url=repo_url).first()
-    
-    if not repo:
-        db.close()
-        return "Error: Repo not found in DB. Run connect first."
+    # 4. Database Operations
+    db: Session = SessionLocal()
+    try:
+        # Find Repo in DB
+        repo = db.query(Repo).filter_by(url=repo_url).first()
+        if not repo:
+            return "Error: Repo not connected locally. Run 'connect' first."
 
-    # Track which issue numbers are currently open on GitHub
-    open_numbers = set()
-    new_count = 0
-    updated_count = 0
-    closed_count = 0
+        # Track stats
+        open_numbers = set()
+        stats = {"new": 0, "updated": 0, "closed": 0, "skipped": 0}
 
-    for i_data in gh_issues:
-        num = i_data["number"]
-        open_numbers.add(num)
-        
-        # Check if exists
-        issue = db.query(Issue).filter_by(repo_id=repo.id, number=num).first()
-        
-        if not issue:
-            # CREATE NEW
-            new_issue = Issue(
-                repo_id=repo.id,
-                number=num,
-                title=i_data["title"],
-                body=i_data.get("body", ""),
-                state="open",
-                status="NEW"
-            )
-            db.add(new_issue)
-            new_count += 1
-        else:
-            # UPDATE EXISTING
-            if issue.state == "closed":
-                issue.state = "open" # Re-opened
-                # If it was DONE, reset to NEW or keep status if we were working on it
-                if issue.status == "DONE":
-                     issue.status = "NEW" 
-                updated_count += 1
+        # --- PROCESS OPEN ISSUES FROM GITHUB ---
+        for i_data in gh_issues:
+            num = i_data["number"]
+            title = i_data["title"]
+            body = i_data.get("body", "") or ""
             
-            issue.title = i_data["title"]
-            issue.body = i_data.get("body", "")
+            open_numbers.add(num)
+            
+            # Check if issue exists locally
+            issue = db.query(Issue).filter_by(repo_id=repo.id, number=num).first()
+            
+            if not issue:
+                # CREATE NEW
+                new_issue = Issue(
+                    repo_id=repo.id,
+                    number=num,
+                    title=title,
+                    body=body,
+                    state="open",
+                    status="NEW"
+                )
+                db.add(new_issue)
+                stats["new"] += 1
+                logger.info(f"➕ Added #{num}: {title[:30]}...")
+            else:
+                # UPDATE EXISTING
+                # Check for changes to minimize DB writes
+                needs_update = False
+                
+                # 1. Re-open if it was closed
+                if issue.state == "closed":
+                    issue.state = "open"
+                    if issue.status == "DONE":
+                        issue.status = "NEW" # Reset flow if re-opened
+                    needs_update = True
+                    stats["updated"] += 1
+                
+                # 2. Update content if changed
+                if issue.title != title or issue.body != body:
+                    issue.title = title
+                    issue.body = body
+                    needs_update = True
+                    if not needs_update: stats["updated"] += 1 # Avoid double counting
+                
+                if not needs_update:
+                    stats["skipped"] += 1
 
-    # 4. Close Stale Issues (The Fix)
-    # If a local issue is 'open' but NOT in GitHub's open list, it means it was closed on GitHub.
-    local_open_issues = db.query(Issue).filter(Issue.repo_id == repo.id, Issue.state == "open").all()
-    
-    for local_issue in local_open_issues:
-        if local_issue.number not in open_numbers:
-            local_issue.state = "closed"
-            local_issue.status = "DONE" # <--- THIS UPDATES THE DASHBOARD UI
-            closed_count += 1
+        # --- CLOSE STALE ISSUES ---
+        # Any local issue that is 'open' but NOT in the fetch list is considered closed on GitHub.
+        local_open_issues = db.query(Issue).filter(Issue.repo_id == repo.id, Issue.state == "open").all()
+        
+        for local_issue in local_open_issues:
+            if local_issue.number not in open_numbers:
+                local_issue.state = "closed"
+                local_issue.status = "DONE" # Update UI status
+                stats["closed"] += 1
+                logger.info(f"✔ Closed #{local_issue.number} (Not found in open list)")
 
-    db.commit()
-    db.close()
-    
-    return f"Synced: {new_count} new, {updated_count} updated, {closed_count} closed."
+        db.commit()
+        
+        summary = f"Synced: {stats['new']} new, {stats['updated']} updated, {stats['closed']} closed."
+        logger.info(summary)
+        return summary
+
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Database Sync Error: {e}")
+        return f"Database Error: {e}"
+    finally:
+        db.close()

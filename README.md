@@ -205,3 +205,5 @@ This project is provided as-is for educational and development purposes.
 ## Contributing
 
 Contributions are welcome! Please open an issue or submit a Pull Request with any improvements or bug fixes.
+
+python main.py remove sherif-tester

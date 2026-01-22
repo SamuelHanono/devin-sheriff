@@ -2,13 +2,18 @@ import httpx
 import json
 import time
 import re
+import logging
+from typing import Optional, Dict, Any
 from .config import AppConfig
+
+# --- LOGGING SETUP ---
+logger = logging.getLogger("devin_client")
+logging.basicConfig(level=logging.INFO)
 
 class DevinClient:
     def __init__(self, config: AppConfig):
         self.api_key = config.devin_api_key
-        # Use official V1 API endpoint
-        self.base_url = "https://api.devin.ai/v1"
+        self.base_url = config.devin_api_url
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
@@ -21,14 +26,16 @@ class DevinClient:
                 resp = client.get(f"{self.base_url}/sessions", headers=self.headers, params={"limit": 1})
                 resp.raise_for_status()
                 return True
-        except Exception:
+        except Exception as e:
+            logger.error(f"Devin Auth Failed: {e}")
             return False
 
-    def _wait_for_session(self, session_id: str, timeout_seconds=300):
+    def _wait_for_session(self, session_id: str, timeout_seconds=300) -> Dict[str, Any]:
         """Polls the session until it stops or completes."""
         start_time = time.time()
         
-        # We increase timeout slightly for real-world usage
+        logger.info(f"⏳ Waiting for Session {session_id} (Timeout: {timeout_seconds}s)...")
+        
         with httpx.Client(timeout=30.0) as client:
             while time.time() - start_time < timeout_seconds:
                 try:
@@ -40,34 +47,33 @@ class DevinClient:
                     raw_status = data.get("status_enum")
                     status = (raw_status or "").lower() 
                     
-                    # Log for debugging (prints to terminal)
-                    print(f"Session {session_id} status: {status}")
-
-                    # --- FIXED: Added "finished" to this list ---
                     if status in ["stopped", "completed", "terminated", "blocked", "finished"]:
+                        logger.info(f"✅ Session {session_id} finished with status: {status}")
                         return data
-                    # --------------------------------------------
                     
                     if status == "error":
                          raise Exception(f"Devin Session Error: {data}")
                     
                 except httpx.RequestError as e:
-                    print(f"Network glitch, retrying: {e}")
+                    logger.warning(f"Network glitch, retrying: {e}")
 
-                time.sleep(4) # Wait before polling again
+                time.sleep(5) # Poll every 5 seconds
                 
         raise TimeoutError(f"Devin session {session_id} timed out after {timeout_seconds}s")
 
-    def _extract_last_json(self, session_data):
+    def _extract_last_json(self, session_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Digs through session history to find the JSON output we asked for.
         """
-        # 1. Try structured output if available
+        # 1. Try structured output if available (Future-proofing)
         if "structured_output" in session_data and session_data["structured_output"]:
             return session_data["structured_output"]
 
         # 2. Parse last assistant message
-        session_id = session_data["session_id"]
+        session_id = session_data.get("session_id")
+        if not session_id:
+             return {"error": "Invalid session data", "raw": session_data}
+
         try:
             with httpx.Client(timeout=30.0) as client:
                 resp = client.get(f"{self.base_url}/sessions/{session_id}/events", headers=self.headers)
@@ -82,10 +88,10 @@ class DevinClient:
                             if json_match:
                                 try:
                                     return json.loads(json_match.group(0))
-                                except:
+                                except json.JSONDecodeError:
                                     continue
         except Exception as e:
-            print(f"Error fetching events: {e}")
+            logger.error(f"Error fetching events: {e}")
         
         # Fallback if parsing fails
         return {
@@ -95,20 +101,20 @@ class DevinClient:
 
     def start_scope_session(self, repo_url: str, issue_number: int, title: str, body: str):
         """
-        Starts a Scope session for a specific REPO.
+        Starts a Scope session. Timeout: 5 minutes.
         """
         system_prompt = (
-            "You are a Senior Software Architect. SCOPE a GitHub issue.\n"
+            "You are a Senior Software Architect. Your goal is to SCOPE a GitHub issue.\n"
             f"1. Clone the repository: {repo_url}\n"
-            "2. Analyze the issue described below.\n"
-            "3. Return a JSON object with this structure:\n"
+            "2. Analyze the issue described below. Read the code to understand the root cause.\n"
+            "3. Return a JSON object with this EXACT structure:\n"
             "{\n"
-            '  "summary": "...",\n'
-            '  "files_to_change": ["..."],\n'
-            '  "action_plan": ["..."],\n'
+            '  "summary": "Brief summary of the problem",\n'
+            '  "files_to_change": ["list", "of", "files"],\n'
+            '  "action_plan": ["step 1", "step 2", "step 3"],\n'
             '  "confidence": 85\n'
             "}\n"
-            "Return ONLY raw JSON. No markdown."
+            "Return ONLY raw JSON. No markdown formatting."
         )
 
         user_message = f"Issue #{issue_number}: {title}\n\n{body}"
@@ -118,28 +124,31 @@ class DevinClient:
             "idempotent": True 
         }
 
-        with httpx.Client(timeout=30.0) as client:
-            resp = client.post(f"{self.base_url}/sessions", json=payload, headers=self.headers)
-            resp.raise_for_status()
-            session_id = resp.json()["session_id"]
-            print(f"Started Scope Session: {session_id}")
-            
-            final_data = self._wait_for_session(session_id)
-            return self._extract_last_json(final_data)
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                resp = client.post(f"{self.base_url}/sessions", json=payload, headers=self.headers)
+                resp.raise_for_status()
+                session_id = resp.json()["session_id"]
+                logger.info(f"🚀 Started Scope Session: {session_id}")
+                
+                final_data = self._wait_for_session(session_id, timeout_seconds=300)
+                return self._extract_last_json(final_data)
+        except Exception as e:
+            logger.error(f"Scope Session Failed: {e}")
+            raise e
 
     def start_execute_session(self, repo_url: str, issue_number: int, title: str, plan_json: dict):
         """
-        Starts an Execution session for a specific REPO.
+        Starts an Execution session. Timeout: 10 minutes.
         """
         system_prompt = (
-            "You are a Senior DevOps Engineer. FIX a GitHub issue.\n"
+            "You are a Senior DevOps Engineer. Your goal is to FIX a GitHub issue.\n"
             f"1. Clone the repository: {repo_url}\n"
-            f"2. Follow this PLAN exactly:\n{json.dumps(plan_json)}\n"
-            "3. Create a branch, commit changes, and push.\n"
-            # --- FIXED: Added instruction to auto-close issue ---
-            f"4. Open a PR and ensure the description says 'Closes #{issue_number}' to link it.\n"
-            # ----------------------------------------------------
-            "5. Return JSON: { \"pr_url\": \"...\", \"summary\": \"...\" }"
+            f"2. Follow this APPROVED PLAN exactly:\n{json.dumps(plan_json)}\n"
+            "3. Create a new branch, write the code, run tests to verify.\n"
+            "4. Commit changes and push the branch.\n"
+            f"5. Open a Pull Request. **IMPORTANT:** The PR description MUST include 'Closes #{issue_number}'.\n"
+            "6. Return JSON: { \"pr_url\": \"...\", \"summary\": \"...\" }"
         )
 
         payload = {
@@ -147,13 +156,17 @@ class DevinClient:
             "idempotent": True
         }
 
-        with httpx.Client(timeout=30.0) as client:
-            resp = client.post(f"{self.base_url}/sessions", json=payload, headers=self.headers)
-            resp.raise_for_status()
-            data = resp.json()
-            session_id = data["session_id"]
-            print(f"Started Execute Session: {session_id}")
-            
-            # Wait for completion (10 min timeout for fixes)
-            final_data = self._wait_for_session(session_id, timeout_seconds=600)
-            return self._extract_last_json(final_data)
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                resp = client.post(f"{self.base_url}/sessions", json=payload, headers=self.headers)
+                resp.raise_for_status()
+                data = resp.json()
+                session_id = data["session_id"]
+                logger.info(f"🚀 Started Execute Session: {session_id}")
+                
+                # Wait for completion (10 min timeout for fixes)
+                final_data = self._wait_for_session(session_id, timeout_seconds=600)
+                return self._extract_last_json(final_data)
+        except Exception as e:
+            logger.error(f"Execute Session Failed: {e}")
+            raise e

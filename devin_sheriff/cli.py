@@ -1,133 +1,208 @@
 import typer
 import re
-from rich.console import Console
-from rich.panel import Panel
-from .config import load_config, save_config, AppConfig
+from typing import Optional
+from .config import load_config, save_config, Config, ensure_config_dir
+from .models import init_db, SessionLocal, Repo, Issue
+from .sync import sync_repo_issues
 from .github_client import GitHubClient
 from .devin_client import DevinClient
-from .models import SessionLocal, Repo, Issue
 
-app = typer.Typer()
-console = Console()
+# Initialize with help text
+app = typer.Typer(help="🤠 Devin Sheriff CLI - Manage your AI Engineer locally.")
+
+# --- HELPERS ---
+def get_db():
+    """Helper to get DB session."""
+    return SessionLocal()
+
+def print_success(msg: str):
+    typer.echo(typer.style(f"✓ {msg}", fg=typer.colors.GREEN))
+
+def print_warning(msg: str):
+    typer.echo(typer.style(f"ℹ {msg}", fg=typer.colors.YELLOW))
+
+def print_error(msg: str):
+    typer.echo(typer.style(f"✗ {msg}", fg=typer.colors.RED, bold=True))
+
+# --- COMMANDS ---
 
 @app.command()
 def setup():
     """
-    Interactive setup to configure API keys.
+    Interactive setup to store your API keys securely.
     """
-    console.print(Panel.fit("Devin Sheriff (Local) Setup", style="bold blue"))
-
-    current_config = load_config()
-
-    # 1. GitHub Token
-    github_token = typer.prompt(
-        "Enter GitHub PAT (Personal Access Token)", 
-        default=current_config.github_token or "", 
-        hide_input=False 
-    )
+    ensure_config_dir()
+    init_db()
     
-    # 2. Devin API Key
-    devin_key = typer.prompt(
-        "Enter Devin API Key", 
-        default=current_config.devin_api_key or "", 
-        hide_input=False
-    )
+    typer.echo(typer.style("🤠 Devin Sheriff Setup", fg=typer.colors.CYAN, bold=True))
+    typer.echo("Keys are stored locally in ~/.devin-sheriff/config.json\n")
+    
+    # Load existing or create new
+    try:
+        current = load_config()
+        gh_token = current.github_token
+        devin_key = current.devin_api_key
+    except:
+        gh_token = ""
+        devin_key = ""
+
+    new_gh = typer.prompt("Enter GitHub PAT", default=gh_token, hide_input=True)
+    new_devin = typer.prompt("Enter Devin API Key", default=devin_key, hide_input=True)
 
     # Save
-    new_config = AppConfig(github_token=github_token, devin_api_key=devin_key)
-    save_config(new_config)
-    console.print("[green]✓ Configuration saved to ~/.devin-sheriff/config.json[/green]")
-
-    # Verify GitHub
-    console.print("\n[yellow]Verifying GitHub connection...[/yellow]")
+    save_config(Config(github_token=new_gh, devin_api_key=new_devin))
+    print_success("Configuration saved.")
+    
+    # Verify immediately
+    typer.echo("\nVerifying connections...")
+    config = load_config()
+    
+    # 1. Verify GitHub
     try:
-        gh_client = GitHubClient(new_config)
-        user = gh_client.verify_auth()
-        console.print(f"[bold green]✓ GitHub Connected as: {user}[/bold green]")
+        gh = GitHubClient(config)
+        user = gh.verify_auth()
+        print_success(f"GitHub Connected: {user}")
     except Exception as e:
-        console.print(f"[bold red]✗ GitHub Failed:[/bold red] {e}")
+        print_error(f"GitHub Verification Failed: {e}")
 
-    # Verify Devin
-    console.print("\n[yellow]Verifying Devin connection...[/yellow]")
+    # 2. Verify Devin
     try:
-        dev_client = DevinClient(new_config)
-        dev_client.verify_auth()
-        console.print("[bold green]✓ Devin API Key Stored[/bold green]")
+        devin = DevinClient(config)
+        if devin.verify_auth():
+            print_success("Devin API Connected")
+        else:
+            print_error("Devin API Key Invalid")
     except Exception as e:
-        console.print(f"[bold red]✗ Devin Failed:[/bold red] {e}")
+        print_error(f"Devin Check Failed: {e}")
+
 
 @app.command()
-def connect(repo_url: str):
+def connect(url: str):
     """
-    Connect to a GitHub repo and fetch open issues.
-    Usage: python main.py connect https://github.com/owner/name
+    Connect a GitHub repository to the dashboard.
+    Example: python main.py connect https://github.com/owner/repo
     """
     config = load_config()
     if not config.github_token:
-        console.print("[red]Not authenticated. Run 'setup' first.[/red]")
-        return
+        print_error("Configuration missing. Run 'python main.py setup' first.")
+        raise typer.Exit(code=1)
 
-    # Parse owner/name from URL
-    match = re.search(r"github\.com/([^/]+)/([^/]+)", repo_url)
+    # Regex to parse owner/repo
+    match = re.search(r"github\.com/([^/]+)/([^/]+)", url)
     if not match:
-        console.print("[red]Invalid GitHub URL. Must be https://github.com/owner/repo[/red]")
-        return
-    
+        print_error("Invalid GitHub URL. Must contain 'github.com/owner/repo'.")
+        raise typer.Exit(code=1)
+
     owner, repo_name = match.groups()
-    repo_name = repo_name.replace(".git", "") # handle .git extension if present
+    repo_name = repo_name.replace(".git", "") # Clean .git extension
 
-    console.print(f"[yellow]Connecting to {owner}/{repo_name}...[/yellow]")
-    
+    db = get_db()
     try:
-        gh = GitHubClient(config)
-        
-        # 1. Get Repo Info
-        repo_data = gh.get_repo_details(owner, repo_name)
-        
-        # 2. Save Repo to DB
-        db = SessionLocal()
-        repo = db.query(Repo).filter_by(url=repo_url).first()
-        if not repo:
-            repo = Repo(
-                owner=owner, 
-                name=repo_name, 
-                url=repo_url,
-                default_branch=repo_data.get("default_branch", "main")
-            )
-            db.add(repo)
-            db.commit()
-            console.print(f"[green]✓ Repo '{repo_name}' added to database.[/green]")
-        else:
-            console.print(f"[blue]ℹ Repo '{repo_name}' already tracked.[/blue]")
+        # Check for duplicates
+        existing = db.query(Repo).filter(Repo.owner == owner, Repo.name == repo_name).first()
+        if existing:
+            print_warning(f"Repo '{owner}/{repo_name}' is already connected.")
+            if typer.confirm("Do you want to re-sync issues now?"):
+                msg = sync_repo_issues(existing.url)
+                print_success(msg)
+            return
 
-        # 3. Fetch Issues
-        console.print("[yellow]Fetching open issues...[/yellow]")
-        issues_data = gh.fetch_open_issues(owner, repo_name)
-        
-        new_count = 0
-        for i_data in issues_data:
-            # Check if issue exists
-            exists = db.query(Issue).filter_by(repo_id=repo.id, number=i_data["number"]).first()
-            if not exists:
-                new_issue = Issue(
-                    repo_id=repo.id,
-                    number=i_data["number"],
-                    title=i_data["title"],
-                    body=i_data.get("body", ""),
-                    state=i_data["state"],
-                    status="NEW"
-                )
-                db.add(new_issue)
-                new_count += 1
-        
+        # Add new repo
+        repo = Repo(url=url, owner=owner, name=repo_name)
+        db.add(repo)
         db.commit()
-        console.print(f"[bold green]✓ Synced {len(issues_data)} open issues ({new_count} new).[/bold green]")
+        print_success(f"Repo '{repo_name}' added to database.")
+        
+        # Auto-Sync
+        typer.echo("Fetching open issues...")
+        msg = sync_repo_issues(url)
+        print_success(msg)
+
+    finally:
         db.close()
 
-    except Exception as e:
-        console.print(f"[bold red]Error connecting to repo:[/bold red] {e}")
+
+@app.command("list")
+def list_repos():
+    """
+    List all connected repositories and their issue counts.
+    """
+    db = get_db()
+    try:
+        repos = db.query(Repo).all()
+        if not repos:
+            print_warning("No repositories connected yet.")
+            return
+
+        typer.echo(f"{'ID':<4} | {'Repository':<30} | {'Issues (Open)':<10}")
+        typer.echo("-" * 50)
+        
+        for r in repos:
+            # Count open issues
+            count = db.query(Issue).filter(Issue.repo_id == r.id, Issue.state == "open").count()
+            typer.echo(f"{r.id:<4} | {r.owner}/{r.name:<25} | {count:<10}")
+            
+    finally:
+        db.close()
+
 
 @app.command()
-def check():
-    """Quickly check connection status."""
-    setup()
+def sync(repo_name: Optional[str] = typer.Argument(None)):
+    """
+    Sync issues from GitHub.
+    Usage: 'python main.py sync' (Syncs ALL) or 'python main.py sync repo-name'
+    """
+    db = get_db()
+    try:
+        repos = db.query(Repo).all()
+        if not repos:
+            print_warning("No repos to sync.")
+            return
+
+        target_repos = repos
+        if repo_name:
+            target_repos = [r for r in repos if r.name == repo_name]
+            if not target_repos:
+                print_error(f"Repository '{repo_name}' not found.")
+                return
+
+        for r in target_repos:
+            typer.echo(f"Syncing {r.owner}/{r.name}...")
+            msg = sync_repo_issues(r.url)
+            print_success(f"{r.name}: {msg}")
+
+    finally:
+        db.close()
+
+
+@app.command()
+def remove(repo_name: str):
+    """
+    Disconnect a repository and delete its local history.
+    """
+    db = get_db()
+    try:
+        repo = db.query(Repo).filter(Repo.name == repo_name).first()
+        if not repo:
+            print_error(f"Repository '{repo_name}' not found.")
+            return
+
+        confirm = typer.confirm(f"Are you sure you want to remove '{repo.name}' and all its local history?", default=False)
+        if not confirm:
+            typer.echo("Aborted.")
+            return
+
+        # Cascade delete (SQLAlchemy usually handles this, but let's be explicit if needed)
+        db.query(Issue).filter(Issue.repo_id == repo.id).delete()
+        db.delete(repo)
+        db.commit()
+        
+        print_success(f"Repository '{repo_name}' removed.")
+    
+    except Exception as e:
+        print_error(f"Error removing repo: {e}")
+    finally:
+        db.close()
+
+if __name__ == "__main__":
+    app()
