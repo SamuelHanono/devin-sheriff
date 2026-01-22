@@ -43,78 +43,125 @@ devin-sheriff/
 └── ~/.devin-sheriff/          # Local config directory (created on setup)
     ├── config.json            # API keys
     └── sheriff.db             # SQLite database
+
 ```
 
 ## Prerequisites
 
 Before installing Devin Sheriff, ensure you have the following:
 
-- Python 3.8 or higher
-- Git
-- A GitHub Personal Access Token (PAT) with repo access
-- A Devin API Key (obtain from your Devin account)
+* Python 3.8 or higher
+* Git
+* A GitHub Personal Access Token (PAT) with repo access
+* A Devin API Key (obtain from your Devin account)
 
-## Installation
+## Installation & Setup
 
-Clone the repository and set up a virtual environment:
-
+1. **Clone the repository and create a virtual environment:**
 ```bash
 git clone https://github.com/SamuelHanono/devin-sheriff.git
 cd devin-sheriff
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
+
 ```
 
-Run the interactive setup to configure your API keys:
 
+2. **Run the interactive setup:**
 ```bash
 python main.py setup
+
 ```
 
-This will prompt you for your GitHub PAT and Devin API Key, verify the connections, and save the configuration to `~/.devin-sheriff/config.json`.
+
+**What you should see:**
+The tool will prompt you for your GitHub PAT and Devin API Key. Once entered, it validates the keys immediately.
+```text
+╭─────────────────────────────╮
+│ Devin Sheriff (Local) Setup │
+╰─────────────────────────────╯
+Enter GitHub PAT (Personal Access Token) [ ]: *****************
+Enter Devin API Key [ ]: ***********************
+✓ Configuration saved to ~/.devin-sheriff/config.json
+
+Verifying GitHub connection...
+✓ GitHub Connected as: <YourUsername>
+
+Verifying Devin connection...
+✓ Devin API Key Stored
+
+```
+
+
 
 ## Usage
 
-### Connecting a Repository
+### 1. Connect a Repository
 
-Connect a GitHub repository to start tracking its issues:
+Tell Devin Sheriff which repository you want to work on.
 
 ```bash
-python main.py connect https://github.com/owner/repo
+python main.py connect https://github.com/owner/repo-name
+
 ```
 
-This command fetches the repository details and all open issues, storing them in the local SQLite database.
+**What you should see:**
+The CLI will fetch repository details and sync all open issues to your local database.
 
-### Running the Dashboard
+```text
+Connecting to owner/repo-name...
+✓ Repo 'repo-name' added to database.
+Fetching open issues...
+✓ Synced 12 open issues (12 new).
 
-Launch the Streamlit Dashboard to manage issues visually:
+```
+
+### 2. Run the Dashboard
+
+Launch the visual interface to start managing your issues.
 
 ```bash
+# Ensure you are in your venv
 streamlit run devin_sheriff/dashboard.py
+
 ```
 
-The Dashboard provides the following capabilities:
+**What you should see:**
+A new tab will automatically open in your default browser (usually at `http://localhost:8501`).
 
-**Repository Selection** allows you to switch between connected repositories using the sidebar dropdown.
+* **Left Sidebar:** A dropdown menu to select the repository you connected.
+* **Main View:** A list of issues for that repo.
+* **Issue Actions:** Clicking an issue reveals the "Scope" and "Execute" controls.
 
-**Issue Overview** displays a table of all tracked issues with their status and confidence scores.
+### 3. The AI Workflow
 
-**Scope (Plan)** triggers the Devin AI to analyze an issue and generate an action plan. The AI clones the repository, examines the codebase, and returns a JSON response containing a summary, files to change, step-by-step action plan, and a confidence score (0-100).
+Once in the dashboard, follow this flow:
 
-**Execute (Fix)** takes the approved action plan and instructs Devin to implement the fix. The AI creates a branch, commits the changes, pushes to GitHub, and opens a Pull Request.
+1. **Select an Issue:** Choose an issue from the dropdown list.
+2. **Click "🔍 Start Scope (Plan)":**
+* *What happens:* The system sends the issue to Devin AI.
+* *Visuals:* You will see a spinner ("Contacting Devin API...") for about 30–60 seconds.
+* *Result:* The page reloads, showing a **Green "Scoped" Box** containing a structured Action Plan, Confidence Score, and list of files to change.
 
-**Reset Issue** allows you to clear the scope and status of an issue to start fresh.
+
+3. **Click "🛠 Execute Fix":**
+* *Condition:* Only available if the status is `SCOPED`.
+* *What happens:* Devin AI clones your repo, writes the code according to the plan, pushes a branch, and opens a Pull Request.
+* *Visuals:* A spinner runs while Devin works (this can take 2–10 minutes depending on complexity).
+* *Result:* A **Green "Fix Deployed!" Box** appears with a clickable link to the new GitHub Pull Request.
+
+
 
 ### Issue Status Workflow
 
 Issues progress through the following statuses:
 
 | Status | Description |
-|--------|-------------|
-| NEW | Issue has been fetched but not yet analyzed |
-| SCOPED | Devin has analyzed the issue and generated an action plan |
-| PR_OPEN | Devin has implemented the fix and opened a Pull Request |
+| --- | --- |
+| **NEW** | Issue has been fetched but not yet analyzed. |
+| **SCOPED** | Devin has analyzed the issue and generated an action plan. |
+| **PR_OPEN** | Devin has implemented the fix and opened a Pull Request. |
 
 ## Configuration
 
@@ -126,6 +173,7 @@ All configuration is stored locally in `~/.devin-sheriff/config.json`:
   "devin_api_key": "apk_user_xxxxxxxxxxxx",
   "devin_api_url": "https://api.devin.ai/v1"
 }
+
 ```
 
 The database file `~/.devin-sheriff/sheriff.db` stores all repository and issue data locally.
