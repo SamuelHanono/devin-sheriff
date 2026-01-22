@@ -182,8 +182,9 @@ class AsyncTaskRunner:
         self.thread = threading.Thread(target=task, daemon=True)
         self.thread.start()
     
-    def run_execute(self, repo_url: str, issue_number: int, title: str, plan_json: dict):
-        """Run execution in background."""
+    def run_execute(self, repo_url: str, issue_number: int, title: str, plan_json: dict,
+                    ci_failure_context: Optional[str] = None):
+        """Run execution in background. Optionally accepts ci_failure_context for Auto-Healer."""
         self.status = "running"
         self.progress = 0
         self.error = None
@@ -196,7 +197,10 @@ class AsyncTaskRunner:
                 client = DevinClient(cfg)
                 
                 self.progress = 30
-                result = client.start_execute_session(repo_url, issue_number, title, plan_json)
+                result = client.start_execute_session(
+                    repo_url, issue_number, title, plan_json,
+                    ci_failure_context=ci_failure_context
+                )
                 
                 self.progress = 100
                 self.result = result
@@ -370,6 +374,7 @@ def check_and_update_ci_status(issue: Issue, repo: Repo, db) -> Dict[str, Any]:
 def trigger_auto_heal(issue: Issue, repo: Repo, ci_failures: List[Dict], db):
     """
     Trigger Auto-Healer: Start a new execute session to fix CI failures.
+    Truncates failure descriptions to avoid token limits.
     """
     if issue.retry_count >= 3:
         logger.warning(f"Issue #{issue.number} has reached max retries (3)")
@@ -377,7 +382,12 @@ def trigger_auto_heal(issue: Issue, repo: Repo, ci_failures: List[Dict], db):
     
     failure_context = "CI Check Failures:\n"
     for f in ci_failures[:5]:
-        failure_context += f"- {f['name']}: {f['description']}\n"
+        name = f.get('name', 'Unknown')[:100]
+        desc = f.get('description', 'Check failed')[:200]
+        failure_context += f"- {name}: {desc}\n"
+    
+    if len(failure_context) > 1500:
+        failure_context = failure_context[:1500] + "\n... (truncated for token safety)"
     
     issue.retry_count = (issue.retry_count or 0) + 1
     db.commit()
@@ -725,10 +735,16 @@ def render_issue_workspace(issue, repo, db):
                             if st.button("🔧 Auto-Heal (Retry Fix)", key=f"auto_heal_{issue.id}", type="primary"):
                                 heal_result = trigger_auto_heal(issue, repo, ci_result.get("failures", []), db)
                                 if "error" not in heal_result:
+                                    st.toast(f"🩹 Auto-Healing triggered for Issue #{issue.number}")
+                                    
+                                    st.info("Waiting 5 seconds before calling Devin (rate limiting)...")
+                                    time.sleep(5)
+                                    
                                     task_runner = st.session_state.task_runner
                                     plan_to_use = issue.scope_json or {}
                                     task_runner.run_execute(
-                                        repo.url, issue.number, issue.title, plan_to_use
+                                        repo.url, issue.number, issue.title, plan_to_use,
+                                        ci_failure_context=heal_result.get("failure_context")
                                     )
                                     st.info(f"Auto-Healer triggered (Retry {heal_result['retry_count']}/3)")
                                     time.sleep(1)
