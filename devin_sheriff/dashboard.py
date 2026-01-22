@@ -549,19 +549,13 @@ def main():
     render_danger_zone()
     
     # 3. MAIN CONTENT AREA WITH TABS
-    tab_main, tab_logs, tab_laws, tab_wanted = st.tabs(["🛠 Issue Management", "📜 Live Logs", "👮‍♂️ Laws", "📜 Wanted"])
+    tab_main, tab_laws = st.tabs(["🛠 Issue Management", "👮‍♂️ Laws"])
     
     with tab_main:
         render_main_dashboard(selected_repo, filter_status)
     
-    with tab_logs:
-        render_log_viewer()
-    
     with tab_laws:
         render_laws_tab()
-    
-    with tab_wanted:
-        render_wanted_tab(selected_repo)
 
 
 def render_main_dashboard(selected_repo, filter_status):
