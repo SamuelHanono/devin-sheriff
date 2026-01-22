@@ -56,7 +56,7 @@ Verifying Devin connection...
 ### Connect a Repository
 
 ```bash
-python main.py connect https://github.com/owner/repo-name
+python3 main.py connect https://github.com/owner/repo-name
 ```
 
 **Expected output:**
