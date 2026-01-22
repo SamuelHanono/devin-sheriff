@@ -105,8 +105,9 @@ def sync_repo_issues(repo_url: str) -> str:
                 if issue.title != title or issue.body != body:
                     issue.title = title
                     issue.body = body
+                    if not needs_update:  # Only count if not already counted from state change
+                        stats["updated"] += 1
                     needs_update = True
-                    if not needs_update: stats["updated"] += 1 # Avoid double counting
                 
                 if not needs_update:
                     stats["skipped"] += 1

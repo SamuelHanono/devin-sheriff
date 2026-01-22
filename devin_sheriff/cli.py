@@ -261,6 +261,15 @@ def patrol():
                     issue.body or ""
                 )
                 
+                # Check if Devin returned an error
+                if "error" in plan:
+                    print_error(f"Devin error: {plan.get('error', 'Unknown error')}")
+                    issue.scope_json = plan
+                    issue.last_error = plan.get("error")
+                    db.commit()
+                    failed_count += 1
+                    continue
+                
                 # Update issue in database
                 issue.scope_json = plan
                 issue.confidence = plan.get("confidence", 0)

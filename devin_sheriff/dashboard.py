@@ -478,7 +478,12 @@ def render_issue_workspace(issue, repo, db):
             st.markdown(issue.body if issue.body else "*No description provided.*")
 
         if issue.scope_json:
-            st.success(f"**Plan Ready** (Confidence: {issue.confidence}%)")
+            # Check if scope_json contains an error (failed to parse Devin response)
+            if "error" in issue.scope_json:
+                st.error(f"**Scoping Failed:** {issue.scope_json.get('error', 'Unknown error')}")
+                st.caption("Try re-scoping this issue or check the Live Logs for details.")
+            else:
+                st.success(f"**Plan Ready** (Confidence: {issue.confidence}%)")
             
             # FEATURE 2: Risk Level Badge (Suspect Profiling)
             files_to_change = issue.scope_json.get("files_to_change", [])
