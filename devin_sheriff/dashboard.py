@@ -223,6 +223,135 @@ class AsyncTaskRunner:
 if 'task_runner' not in st.session_state:
     st.session_state.task_runner = AsyncTaskRunner()
 
+
+def render_error_help_card(error_type: str, error_message: str = ""):
+    """
+    Render a friendly error Help Card explaining how to fix common issues.
+    Replaces raw stack traces with actionable guidance.
+    """
+    help_cards = {
+        "401": {
+            "title": "Authentication Failed",
+            "icon": "🔐",
+            "description": "Your API token is invalid or has expired.",
+            "steps": [
+                "Go to GitHub Settings > Developer Settings > Personal Access Tokens",
+                "Generate a new token with 'repo' scope",
+                "Run `python main.py setup` to update your credentials",
+                "Restart the dashboard"
+            ]
+        },
+        "403": {
+            "title": "Access Denied",
+            "icon": "🚫",
+            "description": "Your token doesn't have permission for this action.",
+            "steps": [
+                "Ensure your GitHub token has the 'repo' scope (for private repos)",
+                "For organization repos, check if SSO authorization is required",
+                "Verify you have write access to the repository",
+                "Generate a new token with broader permissions if needed"
+            ]
+        },
+        "404": {
+            "title": "Not Found",
+            "icon": "🔍",
+            "description": "The repository or resource doesn't exist.",
+            "steps": [
+                "Double-check the repository URL for typos",
+                "Ensure the repository hasn't been renamed or deleted",
+                "Verify you have access to private repositories",
+                "Check if the issue number is correct"
+            ]
+        },
+        "rate_limit": {
+            "title": "Rate Limited",
+            "icon": "⏱️",
+            "description": "You've exceeded GitHub's API rate limit.",
+            "steps": [
+                "Wait 15-60 minutes for the rate limit to reset",
+                "Use a GitHub token (authenticated requests have higher limits)",
+                "Reduce the frequency of sync operations",
+                "Check your rate limit status at api.github.com/rate_limit"
+            ]
+        },
+        "connection": {
+            "title": "Connection Error",
+            "icon": "🌐",
+            "description": "Could not connect to the API server.",
+            "steps": [
+                "Check your internet connection",
+                "Verify GitHub/Devin services are not experiencing outages",
+                "Try again in a few moments",
+                "Check if a firewall or proxy is blocking the connection"
+            ]
+        },
+        "devin_auth": {
+            "title": "Devin Authentication Failed",
+            "icon": "🤖",
+            "description": "Your Devin API key is invalid or expired.",
+            "steps": [
+                "Visit the Devin dashboard to get your API key",
+                "Run `python main.py setup` to update your credentials",
+                "Ensure the API key starts with 'apk_'",
+                "Check if your Devin subscription is active"
+            ]
+        },
+        "timeout": {
+            "title": "Request Timeout",
+            "icon": "⏳",
+            "description": "The operation took too long to complete.",
+            "steps": [
+                "The AI might be processing a complex task - try waiting longer",
+                "Check if the repository is very large",
+                "Try scoping a simpler issue first",
+                "If persistent, the service may be under heavy load"
+            ]
+        },
+        "unknown": {
+            "title": "Something Went Wrong",
+            "icon": "❓",
+            "description": "An unexpected error occurred.",
+            "steps": [
+                "Check the Live Mission Log for more details",
+                "Try the operation again",
+                "If the error persists, check the log file at ~/.devin-sheriff/sheriff.log",
+                "Report the issue if it continues"
+            ]
+        }
+    }
+    
+    error_lower = error_message.lower()
+    if "401" in error_message or "unauthorized" in error_lower:
+        card = help_cards["401"]
+    elif "403" in error_message or "forbidden" in error_lower:
+        card = help_cards["403"]
+    elif "404" in error_message or "not found" in error_lower:
+        card = help_cards["404"]
+    elif "rate limit" in error_lower:
+        card = help_cards["rate_limit"]
+    elif "timeout" in error_lower or "timed out" in error_lower:
+        card = help_cards["timeout"]
+    elif "connection" in error_lower or "network" in error_lower:
+        card = help_cards["connection"]
+    elif "devin" in error_lower and ("auth" in error_lower or "api key" in error_lower):
+        card = help_cards["devin_auth"]
+    elif error_type in help_cards:
+        card = help_cards[error_type]
+    else:
+        card = help_cards["unknown"]
+    
+    st.error(f"{card['icon']} **{card['title']}**")
+    st.caption(card['description'])
+    
+    with st.expander("How to Fix This", expanded=True):
+        for i, step in enumerate(card['steps'], 1):
+            st.markdown(f"{i}. {step}")
+    
+    if error_message and error_type != "unknown":
+        with st.expander("Technical Details", expanded=False):
+            st.code(error_message, language="text")
+
+
 # --- RISK ANALYSIS HELPER ---
 def analyze_risk_level(files_to_change: list) -> tuple:
     """
@@ -480,6 +609,174 @@ def get_tribunal_grade_color(grade: str) -> str:
     return grade_colors.get(grade.upper(), "gray")
 
 
+# --- MISSION LOG HELPER ---
+def get_mission_log_entries(num_entries: int = 20) -> List[Dict[str, Any]]:
+    """Get recent log entries formatted for the Mission Log display."""
+    entries = []
+    try:
+        if not LOG_FILE.exists():
+            return [{"time": datetime.now().strftime("%H:%M:%S"), "level": "INFO", "message": "Mission Log initialized. Waiting for activity..."}]
+        
+        with open(LOG_FILE, 'r') as f:
+            lines = f.readlines()[-num_entries:]
+            for line in lines:
+                parts = line.strip().split(' - ', 3)
+                if len(parts) >= 4:
+                    timestamp = parts[0].split(' ')[-1] if ' ' in parts[0] else parts[0]
+                    level = parts[2] if len(parts) > 2 else "INFO"
+                    message = parts[3] if len(parts) > 3 else line.strip()
+                    entries.append({
+                        "time": timestamp[:8],
+                        "level": level,
+                        "message": message[:100]
+                    })
+                else:
+                    entries.append({
+                        "time": datetime.now().strftime("%H:%M:%S"),
+                        "level": "INFO",
+                        "message": line.strip()[:100]
+                    })
+    except Exception as e:
+        entries.append({"time": datetime.now().strftime("%H:%M:%S"), "level": "ERROR", "message": f"Log read error: {e}"})
+    
+    return entries if entries else [{"time": datetime.now().strftime("%H:%M:%S"), "level": "INFO", "message": "No activity yet."}]
+
+
+# --- FIRST-RUN WIZARD ---
+def render_first_run_wizard():
+    """Render a friendly welcome screen for first-time users."""
+    st.markdown("""
+    <style>
+        .welcome-container {
+            text-align: center;
+            padding: 40px 20px;
+        }
+        .welcome-title {
+            font-size: 3em;
+            margin-bottom: 10px;
+        }
+        .welcome-subtitle {
+            font-size: 1.2em;
+            color: #888;
+            margin-bottom: 30px;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    st.markdown('<div class="welcome-container">', unsafe_allow_html=True)
+    st.markdown("# 🤠 Welcome to Devin Sheriff!")
+    st.markdown("### Your AI-Powered Issue Management Partner")
+    st.markdown("</div>", unsafe_allow_html=True)
+    
+    st.markdown("---")
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col2:
+        st.markdown("#### Connect Your First Repository")
+        st.markdown("Paste a GitHub repository URL below to get started. Devin Sheriff works with **any** public or private repository you have access to.")
+        
+        repo_url = st.text_input(
+            "GitHub Repository URL",
+            placeholder="https://github.com/your-username/your-repo",
+            help="Enter the full URL of your GitHub repository"
+        )
+        
+        if st.button("🚀 Connect Repository", type="primary", use_container_width=True):
+            if not repo_url:
+                st.error("Please enter a repository URL.")
+            elif "github.com" not in repo_url:
+                st.error("Please enter a valid GitHub URL (must contain 'github.com').")
+            else:
+                with st.spinner("Connecting to repository..."):
+                    result = connect_repo_from_dashboard(repo_url)
+                    if result["success"]:
+                        st.success(f"Successfully connected to **{result['repo_name']}**!")
+                        st.balloons()
+                        invalidate_cache()
+                        time.sleep(2)
+                        st.rerun()
+                    else:
+                        st.error(result["error"])
+        
+        st.markdown("---")
+        
+        st.markdown("#### Quick Setup Checklist")
+        config = load_config()
+        
+        gh_status = "configured" if config.github_token else "missing"
+        devin_status = "configured" if config.devin_api_key else "missing"
+        
+        if config.github_token:
+            st.markdown("- [x] GitHub Token configured")
+        else:
+            st.markdown("- [ ] GitHub Token **not configured**")
+            st.caption("Run `python main.py setup` in your terminal to configure.")
+        
+        if config.devin_api_key:
+            st.markdown("- [x] Devin API Key configured")
+        else:
+            st.markdown("- [ ] Devin API Key **not configured**")
+            st.caption("Run `python main.py setup` in your terminal to configure.")
+        
+        if not config.is_complete():
+            st.warning("Please complete the setup before connecting a repository.")
+            st.code("python main.py setup", language="bash")
+    
+    render_danger_zone()
+
+
+def connect_repo_from_dashboard(repo_url: str) -> Dict[str, Any]:
+    """Connect a repository directly from the dashboard."""
+    import re
+    
+    config = load_config()
+    if not config.github_token:
+        return {"success": False, "error": "GitHub Token not configured. Run 'python main.py setup' first."}
+    
+    match = re.search(r"github\.com/([^/]+)/([^/]+)", repo_url)
+    if not match:
+        return {"success": False, "error": "Invalid GitHub URL. Must be in format: github.com/owner/repo"}
+    
+    owner, repo_name = match.groups()
+    repo_name = repo_name.replace(".git", "").rstrip("/")
+    
+    try:
+        gh = GitHubClient(config)
+        gh.get_repo_details(owner, repo_name)
+    except Exception as e:
+        error_msg = str(e)
+        if "not found" in error_msg.lower() or "404" in error_msg:
+            return {"success": False, "error": f"Repository '{owner}/{repo_name}' not found. Check the URL and ensure you have access."}
+        elif "401" in error_msg or "unauthorized" in error_msg.lower():
+            return {"success": False, "error": "GitHub authentication failed. Your token may be invalid or expired."}
+        else:
+            return {"success": False, "error": f"Could not connect to repository: {error_msg}"}
+    
+    db = get_db()
+    try:
+        existing = db.query(Repo).filter(Repo.owner == owner, Repo.name == repo_name).first()
+        if existing:
+            return {"success": True, "repo_name": f"{owner}/{repo_name}", "message": "Repository already connected."}
+        
+        clean_url = f"https://github.com/{owner}/{repo_name}"
+        repo = Repo(url=clean_url, owner=owner, name=repo_name)
+        db.add(repo)
+        db.commit()
+        
+        try:
+            sync_repo_issues(clean_url)
+        except Exception as sync_error:
+            logger.warning(f"Initial sync failed: {sync_error}")
+        
+        return {"success": True, "repo_name": f"{owner}/{repo_name}"}
+    except Exception as e:
+        db.rollback()
+        return {"success": False, "error": f"Database error: {str(e)}"}
+    finally:
+        db.close()
+
+
 # --- MAIN DASHBOARD LOGIC ---
 def main():
     st.title("🤠 Devin Sheriff v2.0")
@@ -488,10 +785,9 @@ def main():
     st.sidebar.header("📂 Repository")
     repos = get_cached_repos()
     
+    # FEATURE A: First-Run Wizard
     if not repos:
-        st.sidebar.warning("No repositories connected.")
-        st.sidebar.info("Run `python main.py connect <url>` in your terminal.")
-        render_danger_zone()
+        render_first_run_wizard()
         return
 
     repo_names = [r.name for r in repos]
@@ -565,17 +861,125 @@ def main():
     render_danger_zone()
     
     # 3. MAIN CONTENT AREA WITH TABS
-    tab_main, tab_laws = st.tabs(["🛠 Issue Management", "👮‍♂️ Laws"])
+    tab_main, tab_laws, tab_log = st.tabs(["🛠 Mission Control", "👮‍♂️ Sheriff's Rules", "📡 Live Mission Log"])
     
     with tab_main:
-        render_main_dashboard(selected_repo, filter_status)
+        render_mission_control(selected_repo, filter_status)
     
     with tab_laws:
         render_laws_tab()
+    
+    with tab_log:
+        render_live_mission_log()
 
 
-def render_main_dashboard(selected_repo, filter_status):
-    """Render the main issue management dashboard."""
+# --- FEATURE C: LIVE MISSION LOG ---
+def render_live_mission_log():
+    """Render the Live Mission Log - a real-time scrolling terminal view of system activity."""
+    st.subheader("📡 Live Mission Log")
+    st.caption("Real-time view of Sheriff activity. Auto-refreshes every 5 seconds when enabled.")
+    
+    col1, col2, col3 = st.columns([2, 1, 1])
+    
+    with col1:
+        auto_refresh = st.checkbox("Auto-refresh", value=False, key="mission_log_auto_refresh")
+    
+    with col2:
+        num_lines = st.selectbox("Lines to show", [20, 50, 100, 200], index=1)
+    
+    with col3:
+        if st.button("🔄 Refresh Now", use_container_width=True):
+            st.rerun()
+    
+    st.markdown("---")
+    
+    log_entries = get_mission_log_entries(num_lines)
+    
+    log_html = """
+    <style>
+        .mission-log {
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            background-color: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 15px;
+            max-height: 500px;
+            overflow-y: auto;
+            color: #c9d1d9;
+        }
+        .log-entry {
+            margin: 2px 0;
+            padding: 2px 5px;
+            border-radius: 3px;
+        }
+        .log-time {
+            color: #8b949e;
+            margin-right: 10px;
+        }
+        .log-level-INFO { color: #58a6ff; }
+        .log-level-WARNING { color: #d29922; }
+        .log-level-ERROR { color: #f85149; }
+        .log-level-DEBUG { color: #8b949e; }
+        .log-message { color: #c9d1d9; }
+    </style>
+    <div class="mission-log">
+    """
+    
+    for entry in log_entries:
+        level_class = f"log-level-{entry['level']}"
+        log_html += f"""
+        <div class="log-entry">
+            <span class="log-time">[{entry['time']}]</span>
+            <span class="{level_class}">[{entry['level']}]</span>
+            <span class="log-message">{entry['message']}</span>
+        </div>
+        """
+    
+    log_html += "</div>"
+    
+    st.markdown(log_html, unsafe_allow_html=True)
+    
+    if auto_refresh:
+        time.sleep(5)
+        st.rerun()
+    
+    st.markdown("---")
+    st.markdown("**Log File Location:**")
+    st.code(str(LOG_FILE), language=None)
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("📥 Download Full Log", use_container_width=True):
+            try:
+                if LOG_FILE.exists():
+                    log_content = LOG_FILE.read_text()
+                    st.download_button(
+                        label="Click to Download",
+                        data=log_content,
+                        file_name="sheriff.log",
+                        mime="text/plain"
+                    )
+                else:
+                    st.warning("No log file found yet.")
+            except Exception as e:
+                st.error(f"Error reading log: {e}")
+    
+    with col2:
+        if st.button("🗑️ Clear Log File", use_container_width=True):
+            try:
+                if LOG_FILE.exists():
+                    LOG_FILE.write_text("")
+                    st.success("Log file cleared!")
+                    time.sleep(1)
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Error clearing log: {e}")
+
+
+# --- MISSION CONTROL: 3-COLUMN LAYOUT ---
+def render_mission_control(selected_repo, filter_status):
+    """Render the Mission Control dashboard with 3-column layout for high data density."""
     db = get_db()
     
     try:
@@ -587,11 +991,14 @@ def render_main_dashboard(selected_repo, filter_status):
         count_new = len([i for i in all_issues if i.status == "NEW"])
         count_scoped = len([i for i in all_issues if i.status == "SCOPED"])
         count_pr = len([i for i in all_issues if i.status == "PR_OPEN"])
+        count_executing = len([i for i in all_issues if i.status == "EXECUTING"])
 
-        m1, m2, m3 = st.columns(3)
-        m1.metric("New Issues", count_new)
-        m2.metric("Scoped & Planned", count_scoped)
-        m3.metric("PRs Open", count_pr)
+        st.markdown("### 📊 Status Overview")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("🆕 New", count_new)
+        m2.metric("📋 Scoped", count_scoped)
+        m3.metric("⚙️ Executing", count_executing)
+        m4.metric("🚀 PRs Open", count_pr)
 
         st.divider()
 
@@ -606,23 +1013,426 @@ def render_main_dashboard(selected_repo, filter_status):
 
         if not display_issues:
             st.info(f"No issues found matching filter: **{filter_status}**")
+            st.markdown("---")
+            st.markdown("#### Quick Actions")
+            if st.button("🔄 Sync Issues from GitHub", use_container_width=True):
+                with st.spinner("Syncing..."):
+                    msg = sync_repo_issues(selected_repo.url)
+                    invalidate_cache()
+                    st.success(msg)
+                    time.sleep(1)
+                    st.rerun()
             return
 
-        st.subheader(f"🛠 Managing Issues ({len(display_issues)})")
+        col_list, col_detail, col_actions = st.columns([1, 2, 1])
         
-        issue_options = {f"#{i.number}: {i.title} [{i.status}]": i.number for i in display_issues}
-        selected_label = st.selectbox("Select an Issue to work on:", options=list(issue_options.keys()))
+        with col_list:
+            st.markdown("#### 📋 Issue Queue")
+            
+            issue_options = {f"#{i.number}: {i.title[:30]}..." if len(i.title) > 30 else f"#{i.number}: {i.title}": i.number for i in display_issues}
+            
+            for label, num in issue_options.items():
+                issue = next((i for i in display_issues if i.number == num), None)
+                if issue:
+                    status_emoji = {
+                        "NEW": "🆕",
+                        "SCOPED": "📋",
+                        "EXECUTING": "⚙️",
+                        "PR_OPEN": "🚀",
+                        "DONE": "✅",
+                        "FAILED": "❌"
+                    }.get(issue.status, "❓")
+                    
+                    is_selected = st.session_state.get('selected_issue_number') == num
+                    button_type = "primary" if is_selected else "secondary"
+                    
+                    if st.button(f"{status_emoji} #{issue.number}", key=f"issue_btn_{num}", use_container_width=True, type=button_type):
+                        st.session_state.selected_issue_number = num
+                        st.rerun()
+            
+            if 'selected_issue_number' not in st.session_state and display_issues:
+                st.session_state.selected_issue_number = display_issues[0].number
         
-        if selected_label:
-            selected_number = issue_options[selected_label]
+        selected_number = st.session_state.get('selected_issue_number')
+        current_issue = None
+        if selected_number:
             current_issue = db.query(Issue).filter(
                 Issue.repo_id == selected_repo.id, 
                 Issue.number == selected_number
             ).first()
-
-            render_issue_workspace(current_issue, selected_repo, db)
+        
+        with col_detail:
+            if current_issue:
+                render_issue_detail_panel(current_issue, selected_repo, db)
+            else:
+                st.info("Select an issue from the queue to view details.")
+        
+        with col_actions:
+            if current_issue:
+                render_action_panel(current_issue, selected_repo, db)
+            else:
+                st.markdown("#### ⚡ Actions")
+                st.caption("Select an issue to see available actions.")
+                
     finally:
         db.close()
+
+
+def render_issue_detail_panel(issue, repo, db):
+    """Render the central detail panel for an issue."""
+    st.markdown(f"#### Issue #{issue.number}")
+    st.markdown(f"**{issue.title}**")
+    
+    status_colors = {
+        "NEW": "gray",
+        "SCOPED": "orange",
+        "EXECUTING": "blue",
+        "PR_OPEN": "green",
+        "DONE": "green",
+        "FAILED": "red"
+    }
+    status_color = status_colors.get(issue.status, "gray")
+    st.markdown(f"Status: :{status_color}[**{issue.status}**]")
+    
+    with st.expander("📖 Description", expanded=False):
+        st.markdown(issue.body if issue.body else "*No description provided.*")
+    
+    if issue.scope_json:
+        if "error" in issue.scope_json:
+            st.error(f"**Scoping Failed:** {issue.scope_json.get('error', 'Unknown error')}")
+        else:
+            st.success(f"**Plan Ready** (Confidence: {issue.confidence}%)")
+            
+            files_to_change = issue.scope_json.get("files_to_change", [])
+            risk_level, risk_color, risk_desc = analyze_risk_level(files_to_change)
+            risk_emoji = {"HIGH": "🔴", "MEDIUM": "🟠", "LOW": "🟢", "UNKNOWN": "⚪"}.get(risk_level, "⚪")
+            st.markdown(f"**Risk:** {risk_emoji} :{risk_color}[{risk_level}] - {risk_desc}")
+            
+            with st.expander("📋 Action Plan", expanded=True):
+                st.markdown("**Strategy:**")
+                for step in issue.scope_json.get("action_plan", []):
+                    st.markdown(f"- {step}")
+                
+                st.markdown("**Files to Change:**")
+                for f in files_to_change:
+                    st.code(f, language="bash")
+    
+    if issue.pr_url:
+        st.markdown("---")
+        st.success(f"🚀 [View Pull Request]({issue.pr_url})")
+        
+        ci_badge = get_ci_badge(issue.ci_status or "unknown", issue.retry_count or 0)
+        st.markdown(f"**CI Status:** {ci_badge}")
+
+
+def get_confidence_zone(confidence: int) -> tuple:
+    """
+    Determine the confidence zone based on the score.
+    Returns (zone_name, zone_color, zone_emoji, can_execute)
+    """
+    if confidence is None:
+        confidence = 0
+    
+    if confidence > 85:
+        return ("GREEN", "green", "🟢", True)
+    elif confidence >= 50:
+        return ("YELLOW", "orange", "🟡", True)
+    else:
+        return ("RED", "red", "🔴", False)
+
+
+def render_confidence_badge(confidence: int):
+    """Render a confidence badge with zone indicator."""
+    zone_name, zone_color, zone_emoji, _ = get_confidence_zone(confidence)
+    
+    if zone_name == "GREEN":
+        st.success(f"{zone_emoji} **Confidence: {confidence}%** - AI is confident")
+    elif zone_name == "YELLOW":
+        st.warning(f"{zone_emoji} **Confidence: {confidence}%** - Review recommended")
+    else:
+        st.error(f"{zone_emoji} **Confidence: {confidence}%** - AI needs guidance")
+
+
+def render_action_panel(issue, repo, db):
+    """Render the action panel for an issue with Confidence Protocol."""
+    st.markdown("#### ⚡ Actions")
+    
+    task_runner = st.session_state.task_runner
+    
+    if task_runner.status == "completed":
+        handle_task_completion(issue, task_runner, db)
+        st.rerun()
+    elif task_runner.status == "failed":
+        render_error_help_card("unknown", task_runner.error or "Unknown error")
+        task_runner.status = "idle"
+    
+    if task_runner.is_running():
+        with st.status("🔄 Task in progress...", expanded=True) as status:
+            progress = task_runner.get_progress()
+            if task_runner.task_type == "scope":
+                if progress < 20:
+                    st.write("🔐 Authenticating with Devin...")
+                elif progress < 40:
+                    st.write("📖 Reading repository structure...")
+                elif progress < 70:
+                    st.write("🔍 Analyzing issue and codebase...")
+                else:
+                    st.write("📋 Generating action plan...")
+            else:
+                if progress < 20:
+                    st.write("🔐 Authenticating with Devin...")
+                elif progress < 40:
+                    st.write("📖 Cloning repository...")
+                elif progress < 60:
+                    st.write("💻 Writing code changes...")
+                elif progress < 80:
+                    st.write("🧪 Running tests...")
+                else:
+                    st.write("🚀 Creating pull request...")
+            
+            st.progress(progress / 100)
+        time.sleep(2)
+        st.rerun()
+    else:
+        if issue.status in ["NEW", "DONE"]:
+            if st.button("🔍 Scope Issue", key=f"scope_{issue.id}", type="primary", use_container_width=True):
+                with st.status("Starting scope session...", expanded=True) as status:
+                    st.write("🔐 Authenticating...")
+                    task_runner.run_scope(repo.url, issue.number, issue.title, issue.body, repo_id=repo.id)
+                    st.write("📤 Request sent to Devin")
+                st.toast("🔍 Scoping started!", icon="🔍")
+                time.sleep(1)
+                st.rerun()
+        
+        # --- CONFIDENCE PROTOCOL ---
+        if issue.status == "SCOPED":
+            confidence = issue.confidence or 0
+            zone_name, zone_color, zone_emoji, can_execute = get_confidence_zone(confidence)
+            
+            render_confidence_badge(confidence)
+            st.markdown("---")
+            
+            # Initialize session state for plan review tracking
+            plan_reviewed_key = f"plan_reviewed_{issue.id}"
+            if plan_reviewed_key not in st.session_state:
+                st.session_state[plan_reviewed_key] = False
+            
+            # GREEN ZONE (>85%): Auto-Execute available
+            if zone_name == "GREEN":
+                st.markdown("##### 🟢 Green Zone - High Confidence")
+                st.caption("The AI is confident in this plan. You can proceed with execution.")
+                
+                if st.button("🚀 Auto-Execute", key=f"auto_exec_{issue.id}", type="primary", use_container_width=True):
+                    with st.status("Starting execution...", expanded=True) as status:
+                        st.write("🔐 Authenticating...")
+                        plan_to_use = st.session_state.get('edited_plan') or issue.scope_json
+                        task_runner.run_execute(repo.url, issue.number, issue.title, plan_to_use)
+                        st.write("📤 Request sent to Devin")
+                    st.toast("🚀 Execution started!", icon="🚀")
+                    time.sleep(1)
+                    st.rerun()
+            
+            # YELLOW ZONE (50-85%): Review required before execution
+            elif zone_name == "YELLOW":
+                st.markdown("##### 🟡 Yellow Zone - Review Required")
+                st.caption("The AI has some uncertainty. Please review the plan before proceeding.")
+                
+                # Check if user has reviewed the plan
+                if not st.session_state[plan_reviewed_key]:
+                    with st.expander("📋 View Action Plan (Required)", expanded=False):
+                        if issue.scope_json:
+                            st.markdown("**Summary:**")
+                            st.info(issue.scope_json.get("summary", "No summary available"))
+                            
+                            st.markdown("**Strategy:**")
+                            for step in issue.scope_json.get("action_plan", []):
+                                st.markdown(f"- {step}")
+                            
+                            st.markdown("**Files to Change:**")
+                            for f in issue.scope_json.get("files_to_change", []):
+                                st.code(f, language="bash")
+                            
+                            st.markdown("---")
+                            if st.button("✅ I have reviewed the plan", key=f"review_confirm_{issue.id}", type="primary", use_container_width=True):
+                                st.session_state[plan_reviewed_key] = True
+                                st.toast("Plan reviewed! Execute button unlocked.", icon="✅")
+                                st.rerun()
+                    
+                    st.button("⚠️ Review & Approve", key=f"yellow_exec_{issue.id}", disabled=True, use_container_width=True)
+                    st.caption("⬆️ Expand and review the plan above to unlock execution")
+                else:
+                    st.success("Plan reviewed!")
+                    if st.button("⚠️ Review & Approve", key=f"yellow_exec_{issue.id}", type="primary", use_container_width=True):
+                        with st.status("Starting execution...", expanded=True) as status:
+                            st.write("🔐 Authenticating...")
+                            plan_to_use = st.session_state.get('edited_plan') or issue.scope_json
+                            task_runner.run_execute(repo.url, issue.number, issue.title, plan_to_use)
+                            st.write("📤 Request sent to Devin")
+                        st.toast("🚀 Execution started!", icon="🚀")
+                        time.sleep(1)
+                        st.rerun()
+            
+            # RED ZONE (<50%): Execution blocked
+            else:
+                st.markdown("##### 🔴 Red Zone - Confidence Too Low")
+                st.caption("The AI is uncertain about this issue. Provide more context to improve the plan.")
+                
+                st.button("⛔ Confidence Too Low", key=f"red_blocked_{issue.id}", disabled=True, use_container_width=True)
+                
+                st.markdown("---")
+                st.markdown("**Refine the Plan**")
+                st.caption("Provide additional context to help the AI understand the issue better.")
+                
+                refine_input = st.text_area(
+                    "Additional context or instructions:",
+                    placeholder="e.g., 'The bug is in auth.py, not main.py' or 'Focus on the API validation logic'",
+                    height=100,
+                    key=f"refine_input_{issue.id}"
+                )
+                
+                if st.button("🔄 Re-Scope with Context", key=f"refine_rescope_{issue.id}", type="primary", use_container_width=True):
+                    if not refine_input.strip():
+                        st.warning("Please provide additional context before re-scoping.")
+                    else:
+                        with st.status("Re-scoping with your feedback...", expanded=True) as status:
+                            st.write("🔐 Authenticating...")
+                            st.write("📝 Incorporating your feedback...")
+                            try:
+                                cfg = load_config()
+                                client = DevinClient(cfg)
+                                
+                                st.write("🔍 Analyzing with new context...")
+                                new_plan = client.start_rescope_session(
+                                    repo.url,
+                                    issue.number,
+                                    issue.title,
+                                    issue.body or "",
+                                    issue.scope_json,
+                                    refine_input
+                                )
+                                
+                                issue.scope_json = new_plan
+                                issue.confidence = new_plan.get("confidence", 0)
+                                db.commit()
+                                invalidate_cache()
+                                
+                                st.write("✅ Plan updated!")
+                                status.update(label="Re-scope complete!", state="complete")
+                                
+                                new_conf = new_plan.get("confidence", 0)
+                                if new_conf > 85:
+                                    st.toast(f"Confidence boosted to {new_conf}%! Green Zone unlocked.", icon="🟢")
+                                elif new_conf >= 50:
+                                    st.toast(f"Confidence improved to {new_conf}%. Yellow Zone.", icon="🟡")
+                                else:
+                                    st.toast(f"Confidence at {new_conf}%. Try adding more context.", icon="🔴")
+                                
+                                time.sleep(1)
+                                st.rerun()
+                                
+                            except Exception as e:
+                                st.error(f"Re-scope failed: {str(e)}")
+                                logger.error(f"Re-scope failed for issue #{issue.number}: {e}")
+            
+            st.markdown("---")
+            if st.button("🔄 Start Fresh (Re-Scope)", key=f"rescope_{issue.id}", use_container_width=True):
+                issue.status = "NEW"
+                issue.scope_json = None
+                issue.confidence = 0
+                st.session_state.edited_plan = None
+                st.session_state[plan_reviewed_key] = False
+                db.commit()
+                invalidate_cache()
+                st.toast("Issue reset. Ready for fresh scoping.", icon="🔄")
+                st.rerun()
+        
+        if issue.status == "PR_OPEN" and issue.pr_url:
+            if st.button("🔄 Check CI", key=f"check_ci_{issue.id}", use_container_width=True):
+                with st.status("Checking CI status...", expanded=True) as status:
+                    st.write("🔍 Fetching PR status...")
+                    ci_result = check_and_update_ci_status(issue, repo, db)
+                    
+                    if ci_result["status"] == "passing":
+                        st.write("✅ All checks passed!")
+                        status.update(label="CI Passing!", state="complete")
+                        st.toast("All CI checks passed!", icon="✅")
+                    elif ci_result["status"] == "failing":
+                        st.write(f"❌ {len(ci_result.get('failures', []))} check(s) failed")
+                        status.update(label="CI Failing", state="error")
+                        
+                        if (issue.retry_count or 0) < 3:
+                            st.warning("Auto-Healer available")
+                    elif ci_result["status"] == "pending":
+                        st.write("⏳ Checks still running...")
+                        status.update(label="CI Pending", state="running")
+                        st.toast("CI checks still running...", icon="⏳")
+                    else:
+                        st.write("❓ Status unknown")
+                
+                st.rerun()
+            
+            if issue.ci_status == "failing" and (issue.retry_count or 0) < 3:
+                if st.button("🔧 Auto-Heal", key=f"heal_{issue.id}", type="primary", use_container_width=True):
+                    with st.status("Triggering Auto-Healer...", expanded=True) as status:
+                        st.write("📋 Gathering failure context...")
+                        ci_result = check_and_update_ci_status(issue, repo, db)
+                        heal_result = trigger_auto_heal(issue, repo, ci_result.get("failures", []), db)
+                        
+                        if "error" not in heal_result:
+                            st.write("🔧 Starting fix attempt...")
+                            plan_to_use = issue.scope_json or {}
+                            task_runner.run_execute(
+                                repo.url, issue.number, issue.title, plan_to_use,
+                                ci_failure_context=heal_result.get("failure_context")
+                            )
+                            st.write("📤 Request sent to Devin")
+                            status.update(label="Auto-Heal started!", state="complete")
+                            st.toast(f"Auto-Heal triggered (Retry {heal_result['retry_count']}/3)", icon="🔧")
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            st.error(heal_result["error"])
+    
+    st.markdown("---")
+    st.markdown("**Manual Controls**")
+    
+    if issue.status != "DONE":
+        if st.button("✅ Close Issue", key=f"close_{issue.id}", use_container_width=True):
+            with st.status("Closing issue...", expanded=True) as status:
+                st.write("📝 Updating local database...")
+                result = close_issue_workflow(issue, repo, db, close_on_github=True)
+                
+                if result["github_closed"]:
+                    st.write("🌐 Closed on GitHub")
+                    status.update(label="Issue closed!", state="complete")
+                    st.toast(f"Issue #{issue.number} closed on GitHub!", icon="✅")
+                elif result["error_message"]:
+                    st.write(f"⚠️ GitHub: {result['error_message']}")
+                    status.update(label="Closed locally only", state="error")
+                    render_error_help_card(result.get("error_type", "unknown"), result["error_message"])
+                else:
+                    status.update(label="Closed locally", state="complete")
+                    st.toast(f"Issue #{issue.number} closed locally", icon="✅")
+            
+            invalidate_cache()
+            time.sleep(1)
+            st.rerun()
+    
+    if st.button("🗑 Reset State", key=f"reset_{issue.id}", use_container_width=True):
+        issue.status = "NEW"
+        issue.scope_json = None
+        issue.confidence = None
+        issue.pr_url = None
+        st.session_state.edited_plan = None
+        db.commit()
+        invalidate_cache()
+        st.toast("Issue state reset.", icon="🗑")
+        st.rerun()
+
+
+def render_main_dashboard(selected_repo, filter_status):
+    """Legacy function - redirects to Mission Control."""
+    render_mission_control(selected_repo, filter_status)
 
 
 def render_settings_security():
