@@ -1398,8 +1398,22 @@ def render_action_panel(issue, repo, db):
     
     if issue.status != "DONE":
         if st.button("✅ Close Issue", key=f"close_{issue.id}", use_container_width=True):
-            result = close_issue_workflow(issue, repo, db, close_on_github=False)
-            st.toast(f"Issue #{issue.number} closed!", icon="✅")
+            with st.status("Closing issue...", expanded=True) as status:
+                st.write("📝 Updating local database...")
+                result = close_issue_workflow(issue, repo, db, close_on_github=True)
+                
+                if result["github_closed"]:
+                    st.write("🌐 Closed on GitHub")
+                    status.update(label="Issue closed!", state="complete")
+                    st.toast(f"Issue #{issue.number} closed on GitHub!", icon="✅")
+                elif result["error_message"]:
+                    st.write(f"⚠️ GitHub: {result['error_message']}")
+                    status.update(label="Closed locally only", state="error")
+                    render_error_help_card(result.get("error_type", "unknown"), result["error_message"])
+                else:
+                    status.update(label="Closed locally", state="complete")
+                    st.toast(f"Issue #{issue.number} closed locally", icon="✅")
+            
             invalidate_cache()
             time.sleep(1)
             st.rerun()
