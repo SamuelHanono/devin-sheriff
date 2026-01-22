@@ -32,7 +32,7 @@ pip install -r requirements.txt
 Run the interactive setup to configure your API keys:
 
 ```bash
-python main.py setup
+python3 main.py setup
 ```
 
 **Expected output:**
